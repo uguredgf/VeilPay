@@ -13,6 +13,7 @@ import {
 
 const LACE_EXTENSION_URL =
   'https://chromewebstore.google.com/detail/lace/gafhhkghbfjjkeiendhlofajokpaflmk';
+const LACE_RDNS = 'io.lace.wallet';
 
 function truncate(address: string): string {
   if (address.length <= 14) {
@@ -27,7 +28,11 @@ function getAvailableWallets(): InitialAPI[] {
   }
   return Object.values(window.midnight).filter(
     (wallet): wallet is InitialAPI =>
-      Boolean(wallet) && typeof wallet.name === 'string' && typeof wallet.connect === 'function',
+      Boolean(wallet) &&
+      wallet.rdns === LACE_RDNS &&
+      typeof wallet.name === 'string' &&
+      typeof wallet.apiVersion === 'string' &&
+      typeof wallet.connect === 'function',
   );
 }
 
@@ -50,6 +55,8 @@ const WalletConnect: React.FC = () => {
   const address = walletSession?.address ?? null;
   const walletName = walletSession?.walletName ?? '';
   const networkId = walletSession?.networkId ?? MIDNIGHT_NETWORK_ID;
+  const providerRdns = walletSession?.providerRdns ?? '';
+  const apiVersion = walletSession?.apiVersion ?? '';
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -122,6 +129,8 @@ const WalletConnect: React.FC = () => {
             address: shieldedAddress,
             walletName: wallet.name,
             networkId: connectionStatus.networkId,
+            providerRdns: wallet.rdns,
+            apiVersion: wallet.apiVersion,
           });
           return;
         } catch (candidateError) {
@@ -153,7 +162,7 @@ const WalletConnect: React.FC = () => {
     }
   }, []);
 
-  function disconnect(): void {
+  function clearLocalSession(): void {
     setWalletSession(null);
     setDropdownOpen(false);
   }
@@ -340,8 +349,24 @@ const WalletConnect: React.FC = () => {
               }}
             >
               {walletName} · {networkId}
+              <div style={{ marginTop: '3px', fontSize: '0.66rem' }}>
+                {providerRdns} · API {apiVersion}
+              </div>
             </div>
           )}
+          <div
+            style={{
+              padding: '6px 10px',
+              maxWidth: '290px',
+              fontSize: '0.67rem',
+              lineHeight: 1.4,
+              color: 'var(--text-muted)',
+            }}
+          >
+            The address above was read directly from the Lace Midnight DApp Connector. Clearing
+            this app session does not revoke Lace's saved approval. To require approval again,
+            remove VeilPay under Lace Settings &gt; Authorized DApps.
+          </div>
           <button
             className="btn btn-ghost btn-sm"
             style={{ width: '100%', justifyContent: 'flex-start', gap: '0.5rem' }}
@@ -352,9 +377,9 @@ const WalletConnect: React.FC = () => {
           <button
             className="btn btn-ghost btn-sm"
             style={{ width: '100%', justifyContent: 'flex-start', gap: '0.5rem', color: 'var(--error)' }}
-            onClick={disconnect}
+            onClick={clearLocalSession}
           >
-            <LogOut size={13} /> Disconnect
+            <LogOut size={13} /> Clear VeilPay Session
           </button>
         </div>
       )}

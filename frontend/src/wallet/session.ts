@@ -2,6 +2,8 @@ export interface WalletSession {
   address: string;
   walletName: string;
   networkId: string;
+  providerRdns: string;
+  apiVersion: string;
 }
 
 let currentSession: WalletSession | null = null;
