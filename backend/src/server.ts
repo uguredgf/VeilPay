@@ -38,6 +38,7 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS ?? 'http://localhost:3000,http://
   .map((origin) => origin.trim())
   .filter(Boolean);
 const LOG_FORMAT = process.env.LOG_FORMAT ?? 'dev';
+const LACE_EXTENSION_ORIGIN = 'chrome-extension://gafhhkghbfjjkeiendhlofajokpaflmk';
 
 // ────────────────────────────────────────────────────────────────────────────
 // App setup
@@ -45,8 +46,16 @@ const LOG_FORMAT = process.env.LOG_FORMAT ?? 'dev';
 
 const app = express();
 
-// Security headers
-app.use(helmet());
+// Lace injects its DApp connector into the page's main execution world.
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        scriptSrc: ["'self'", LACE_EXTENSION_ORIGIN],
+      },
+    },
+  }),
+);
 
 // CORS
 app.use(
