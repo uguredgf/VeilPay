@@ -2,6 +2,8 @@
 
 VeilPay is a privacy-preserving payroll product prototype for Midnight Network. It demonstrates employer batch upload, one-time employee claims, Lace wallet discovery, and compliance workflows.
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https%3A%2F%2Fgithub.com%2Fuguredgf%2FVeilPay)
+
 ## Current status
 
 | Area | Status |
