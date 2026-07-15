@@ -33,7 +33,11 @@ function getAvailableWallets(): InitialAPI[] {
 
 function isRetryableNetworkError(error: unknown): boolean {
   const message = String(error).toLowerCase();
-  return message.includes('network id mismatch') || message.includes('invalid network id');
+  return (
+    message.includes('network id mismatch') ||
+    message.includes('invalid network id') ||
+    message.includes('unsupported network')
+  );
 }
 
 const WalletConnect: React.FC = () => {
