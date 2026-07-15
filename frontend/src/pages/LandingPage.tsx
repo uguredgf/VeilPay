@@ -37,10 +37,10 @@ const LandingPage: React.FC = () => {
           <div className="sidebar-brand-icon"><Shield size={18} /></div>
           <span className="sidebar-brand-text">VeilPay</span>
         </div>
-        <div style={{ display: 'flex', gap: '2rem', alignItems: 'center' }}>
-          <a href="#features" style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', textDecoration: 'none' }}>Features</a>
-          <a href="#how" style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', textDecoration: 'none' }}>How it works</a>
-          <a href="#enter" style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', textDecoration: 'none' }}>Get started</a>
+        <div className="landing-nav-links">
+          <a href="#features">Features</a>
+          <a href="#how">How it works</a>
+          <a href="#enter">Get started</a>
         </div>
       </nav>
 
