@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "VeilPay - Privacy-preserving enterprise payroll on Midnight Network",
   "private": true,
+  "engines": {
+    "node": ">=22.0.0 <23.0.0"
+  },
   "workspaces": [
     "contract",
     "backend",
