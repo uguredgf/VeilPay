@@ -81,6 +81,11 @@ const LandingPage: React.FC = () => {
         <h2 style={{ fontSize: '1.4rem', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '2.5rem', textAlign: 'center' }}>
           Choose your portal
         </h2>
+        <p className="demo-privacy-note">
+          Employer and auditor data are isolated in a private workspace created for this browser.
+          Keep using the same browser; clearing site data starts a new empty workspace. Employee
+          access remains protected by a one-time claim key.
+        </p>
         <div className="role-cards">
           {[
             {

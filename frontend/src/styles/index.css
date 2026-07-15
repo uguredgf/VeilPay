@@ -742,6 +742,15 @@ a {
 }
 
 /* Role selection cards */
+.demo-privacy-note {
+  max-width: 640px;
+  margin: -1.5rem auto 2rem;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  line-height: 1.6;
+  text-align: center;
+}
+
 .role-cards {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

@@ -15,9 +15,6 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import {
-  EMPLOYER_ID,
-} from '../config';
-import {
   getSystemHealth,
   executePayroll,
   getPayrollHistory,
@@ -63,7 +60,7 @@ export default function EmployerDashboard() {
 
   async function loadHistory(): Promise<void> {
     try {
-      setRecentBatches(await getPayrollHistory(EMPLOYER_ID));
+      setRecentBatches(await getPayrollHistory());
     } catch (historyError) {
       setError((historyError as Error).message);
     }
@@ -84,7 +81,7 @@ export default function EmployerDashboard() {
     setCsvFile(file);
 
     try {
-      const response = await uploadPayrollCsv(file, EMPLOYER_ID);
+      const response = await uploadPayrollCsv(file);
       setBatchId(response.batch.id);
       setParsedRows(response.preview);
     } catch (uploadError) {

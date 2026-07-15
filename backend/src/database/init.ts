@@ -122,6 +122,31 @@ const SCHEMA = `
   );
 
   CREATE INDEX IF NOT EXISTS idx_block_address ON blocklist(address);
+
+  CREATE TABLE IF NOT EXISTS workspace_allowlist (
+    id           TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    address      TEXT NOT NULL,
+    added_by     TEXT NOT NULL,
+    added_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (workspace_id, address)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_workspace_allow_address
+    ON workspace_allowlist(workspace_id, address);
+
+  CREATE TABLE IF NOT EXISTS workspace_blocklist (
+    id           TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    address      TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    added_by     TEXT NOT NULL,
+    added_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (workspace_id, address)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_workspace_block_address
+    ON workspace_blocklist(workspace_id, address);
 `;
 
 function ensureColumn(tableName: string, columnName: string, definition: string): void {
@@ -137,6 +162,13 @@ function runMigrations(): void {
   ensureColumn('payroll_items', 'withdraw_tx_hash', 'TEXT');
   ensureColumn('payroll_items', 'withdrawal_address', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_items_claim_key_hash ON payroll_items(claim_key_hash)');
+  db.prepare(`
+    UPDATE employees
+    SET name = 'Encrypted employee',
+        wallet_address = 'private:' || id,
+        department = NULL
+    WHERE wallet_address NOT LIKE 'private:%'
+  `).run();
 }
 
 export function initDatabase(): void {

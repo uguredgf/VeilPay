@@ -19,6 +19,7 @@ import {
 } from '../services/payroll.js';
 import { MidnightConfigurationError } from '../services/midnight.js';
 import type { ApiResponse } from '../types/index.js';
+import { getWorkspaceId } from '../middleware/workspace.js';
 
 const router = Router();
 
@@ -43,11 +44,6 @@ const upload = multer({
 
 const ExecutePayrollSchema = z.object({
   batchId: z.string().uuid('batchId must be a valid UUID'),
-});
-
-const EmployerIdSchema = z.object({
-  employerId: z.string().trim().min(1, 'employerId is required').max(128)
-    .regex(/^[a-zA-Z0-9._-]+$/, 'employerId contains unsupported characters'),
 });
 
 const BatchIdParamSchema = z.object({
@@ -92,13 +88,7 @@ router.post(
         return;
       }
 
-      const employer = EmployerIdSchema.safeParse(req.body);
-      if (!employer.success) {
-        sendError(res, 400, employer.error.errors.map((error) => error.message).join('; '));
-        return;
-      }
-
-      const { batch, parsed } = createPayrollBatch(employer.data.employerId, file.buffer);
+      const { batch, parsed } = createPayrollBatch(getWorkspaceId(res), file.buffer);
 
       sendJson(res, {
         batch,
@@ -128,8 +118,9 @@ router.post('/payroll/execute', async (req: Request, res: Response, next: NextFu
       return;
     }
 
-    const batch = await executePayrollBatch(parsed.data.batchId);
-    const claims = getBatchClaimDistribution(parsed.data.batchId);
+    const workspaceId = getWorkspaceId(res);
+    const batch = await executePayrollBatch(parsed.data.batchId, workspaceId);
+    const claims = getBatchClaimDistribution(parsed.data.batchId, workspaceId);
     sendJson(res, { batch, claims });
   } catch (err) {
     if (err instanceof PayrollError) {
@@ -145,17 +136,11 @@ router.post('/payroll/execute', async (req: Request, res: Response, next: NextFu
 });
 
 /**
- * GET /api/employer/payroll/history?employerId=…
+ * GET /api/employer/payroll/history
  */
-router.get('/payroll/history', (req: Request, res: Response, next: NextFunction) => {
+router.get('/payroll/history', (_req: Request, res: Response, next: NextFunction) => {
   try {
-    const parsed = EmployerIdSchema.safeParse(req.query);
-    if (!parsed.success) {
-      sendError(res, 400, parsed.error.errors.map((e) => e.message).join('; '));
-      return;
-    }
-
-    const batches = getPayrollHistory(parsed.data.employerId);
+    const batches = getPayrollHistory(getWorkspaceId(res));
     sendJson(res, { batches });
   } catch (err) {
     next(err);
@@ -173,7 +158,7 @@ router.get('/payroll/batch/:id', (req: Request, res: Response, next: NextFunctio
       return;
     }
 
-    const details = getBatchDetails(parsed.data.id);
+    const details = getBatchDetails(parsed.data.id, getWorkspaceId(res));
     sendJson(res, details);
   } catch (err) {
     if (err instanceof PayrollError) {
@@ -185,17 +170,11 @@ router.get('/payroll/batch/:id', (req: Request, res: Response, next: NextFunctio
 });
 
 /**
- * GET /api/employer/dashboard/stats?employerId=…
+ * GET /api/employer/dashboard/stats
  */
-router.get('/dashboard/stats', (req: Request, res: Response, next: NextFunction) => {
+router.get('/dashboard/stats', (_req: Request, res: Response, next: NextFunction) => {
   try {
-    const parsed = EmployerIdSchema.safeParse(req.query);
-    if (!parsed.success) {
-      sendError(res, 400, parsed.error.errors.map((e) => e.message).join('; '));
-      return;
-    }
-
-    const stats = getDashboardStats(parsed.data.employerId);
+    const stats = getDashboardStats(getWorkspaceId(res));
     sendJson(res, stats);
   } catch (err) {
     next(err);

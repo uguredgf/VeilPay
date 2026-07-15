@@ -26,6 +26,7 @@ import complianceRoutes from './routes/compliance.js';
 
 import type { ApiResponse } from './types/index.js';
 import { assertCryptoConfiguration } from './utils/crypto.js';
+import { requireWorkspace, WORKSPACE_HEADER } from './middleware/workspace.js';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -64,7 +65,7 @@ app.use(
   cors({
     origin: CORS_ORIGINS,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', WORKSPACE_HEADER],
     credentials: true,
   }),
 );
@@ -102,9 +103,9 @@ app.get('/api/health', (_req: Request, res: Response) => {
 // Route groups
 // ────────────────────────────────────────────────────────────────────────────
 
-app.use('/api/employer', employerRoutes);
+app.use('/api/employer', requireWorkspace, employerRoutes);
 app.use('/api/employee', employeeRoutes);
-app.use('/api/compliance', complianceRoutes);
+app.use('/api/compliance', requireWorkspace, complianceRoutes);
 
 // Keep unknown API routes JSON-only, then serve the compiled React app in production.
 app.use('/api', (_req: Request, res: Response) => {

@@ -10,6 +10,7 @@ import CompliancePanel from './pages/CompliancePanel';
 const App: React.FC = () => {
   const location = useLocation();
   const isLanding = location.pathname === '/';
+  const usesPrivateWorkspace = location.pathname === '/employer' || location.pathname === '/compliance';
 
   if (isLanding) {
     return <Routes><Route path="/" element={<LandingPage />} /></Routes>;
@@ -24,6 +25,15 @@ const App: React.FC = () => {
             <span style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
               Midnight Network
             </span>
+            {usesPrivateWorkspace && (
+              <span
+                className="badge badge-info"
+                style={{ marginLeft: '0.75rem' }}
+                title="This browser holds the access key for your private demo workspace."
+              >
+                Private demo workspace
+              </span>
+            )}
           </div>
           <WalletConnect />
         </header>

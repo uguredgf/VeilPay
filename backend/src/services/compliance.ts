@@ -21,6 +21,7 @@ import type {
   PayrollItem,
 } from '../types/index.js';
 import { normalizeWalletAddress } from '../utils/wallet-address.js';
+import { decryptClaimPayload } from '../utils/crypto.js';
 
 // ────────────────────────────────────────────────────────────────────────────
 // Prepared statements
@@ -34,10 +35,17 @@ const stmts = {
     `),
 
   getComplianceByBatch: () =>
-    db.prepare('SELECT * FROM compliance_records WHERE batch_id = ? ORDER BY checked_at DESC LIMIT 1'),
+    db.prepare(`
+      SELECT cr.*
+      FROM compliance_records cr
+      JOIN payroll_batches pb ON pb.id = cr.batch_id
+      WHERE cr.batch_id = ? AND pb.employer_id = ?
+      ORDER BY cr.checked_at DESC
+      LIMIT 1
+    `),
 
   getBatch: () =>
-    db.prepare('SELECT * FROM payroll_batches WHERE id = ?'),
+    db.prepare('SELECT * FROM payroll_batches WHERE id = ? AND employer_id = ?'),
 
   getBatchItems: () =>
     db.prepare('SELECT * FROM payroll_items WHERE batch_id = ?'),
@@ -62,28 +70,35 @@ const stmts = {
           ORDER BY latest.checked_at DESC
           LIMIT 1
         )
+      WHERE pb.employer_id = ?
       ORDER BY pb.created_at DESC
     `),
 
   // Allowlist
   insertAllow: () =>
-    db.prepare('INSERT INTO allowlist (id, address, added_by) VALUES (?, ?, ?)'),
+    db.prepare(`
+      INSERT INTO workspace_allowlist (id, workspace_id, address, added_by)
+      VALUES (?, ?, ?, ?)
+    `),
   deleteAllow: () =>
-    db.prepare('DELETE FROM allowlist WHERE address = ?'),
+    db.prepare('DELETE FROM workspace_allowlist WHERE workspace_id = ? AND address = ?'),
   getAllow: () =>
-    db.prepare('SELECT * FROM allowlist ORDER BY added_at DESC'),
+    db.prepare('SELECT * FROM workspace_allowlist WHERE workspace_id = ? ORDER BY added_at DESC'),
   findAllow: () =>
-    db.prepare('SELECT * FROM allowlist WHERE address = ?'),
+    db.prepare('SELECT * FROM workspace_allowlist WHERE workspace_id = ? AND address = ?'),
 
   // Blocklist
   insertBlock: () =>
-    db.prepare('INSERT INTO blocklist (id, address, reason, added_by) VALUES (?, ?, ?, ?)'),
+    db.prepare(`
+      INSERT INTO workspace_blocklist (id, workspace_id, address, reason, added_by)
+      VALUES (?, ?, ?, ?, ?)
+    `),
   deleteBlock: () =>
-    db.prepare('DELETE FROM blocklist WHERE address = ?'),
+    db.prepare('DELETE FROM workspace_blocklist WHERE workspace_id = ? AND address = ?'),
   getBlock: () =>
-    db.prepare('SELECT * FROM blocklist ORDER BY added_at DESC'),
+    db.prepare('SELECT * FROM workspace_blocklist WHERE workspace_id = ? ORDER BY added_at DESC'),
   findBlock: () =>
-    db.prepare('SELECT * FROM blocklist WHERE address = ?'),
+    db.prepare('SELECT * FROM workspace_blocklist WHERE workspace_id = ? AND address = ?'),
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -99,39 +114,48 @@ const stmts = {
  *  3. Individual amounts are within the compliance threshold.
  *  4. A ZK compliance proof can be generated.
  */
-export async function checkCompliance(batchId: string): Promise<ComplianceRecord> {
-  const batch = stmts.getBatch().get(batchId) as PayrollBatch | undefined;
+export async function checkCompliance(
+  batchId: string,
+  workspaceId: string,
+): Promise<ComplianceRecord> {
+  const batch = stmts.getBatch().get(batchId, workspaceId) as PayrollBatch | undefined;
   if (!batch) throw new ComplianceError(`Batch ${batchId} not found`);
   if (batch.status !== 'completed') {
     throw new ComplianceError(`Batch ${batchId} must be completed before compliance checking.`);
   }
 
   const items = stmts.getBatchItems().all(batchId) as PayrollItem[];
+  const recipientAddresses = items.map((item) => {
+    if (!item.encrypted_data) {
+      throw new ComplianceError(`Encrypted recipient data is missing for item ${item.id}.`);
+    }
+    try {
+      return normalizeWalletAddress(decryptClaimPayload(item.encrypted_data).walletAddress);
+    } catch {
+      throw new ComplianceError(`Encrypted recipient data is invalid for item ${item.id}.`);
+    }
+  });
   const threshold = Number(process.env.COMPLIANCE_THRESHOLD ?? '10000');
   if (!Number.isFinite(threshold) || threshold <= 0) {
     throw new ComplianceError('COMPLIANCE_THRESHOLD must be a positive number.');
   }
   const issues: string[] = [];
 
-  // 1. Blocklist check — look up employees to get wallet addresses
-  for (const item of items) {
-    const emp = db.prepare('SELECT wallet_address FROM employees WHERE id = ?').get(item.employee_id) as { wallet_address: string } | undefined;
-    if (emp) {
-      const blocked = stmts.findBlock().get(emp.wallet_address) as BlocklistEntry | undefined;
-      if (blocked) {
-        issues.push(`Blocked address ${emp.wallet_address}: ${blocked.reason}`);
-      }
+  // 1. Blocklist check against addresses decrypted only for this operation.
+  for (const address of recipientAddresses) {
+    const blocked = stmts.findBlock().get(workspaceId, address) as BlocklistEntry | undefined;
+    if (blocked) {
+      issues.push(`Blocked address ${address}: ${blocked.reason}`);
     }
   }
 
   // 2. Allowlist check (only if the allowlist is populated)
-  const allowlist = stmts.getAllow().all() as AllowlistEntry[];
+  const allowlist = stmts.getAllow().all(workspaceId) as AllowlistEntry[];
   if (allowlist.length > 0) {
     const allowedAddresses = new Set(allowlist.map((a) => a.address.toLowerCase()));
-    for (const item of items) {
-      const emp = db.prepare('SELECT wallet_address FROM employees WHERE id = ?').get(item.employee_id) as { wallet_address: string } | undefined;
-      if (emp && !allowedAddresses.has(emp.wallet_address.toLowerCase())) {
-        issues.push(`Address ${emp.wallet_address} is not on the allowlist.`);
+    for (const address of recipientAddresses) {
+      if (!allowedAddresses.has(address.toLowerCase())) {
+        issues.push(`Address ${address} is not on the allowlist.`);
       }
     }
   }
@@ -167,18 +191,21 @@ export async function checkCompliance(batchId: string): Promise<ComplianceRecord
   logAudit(
     uuid(),
     'compliance.check',
-    'system',
+    workspaceId,
     `Batch ${batchId}: ${status}${issues.length > 0 ? ' — ' + issues.join('; ') : ''}`,
   );
 
-  return stmts.getComplianceByBatch().get(batchId) as ComplianceRecord;
+  return stmts.getComplianceByBatch().get(batchId, workspaceId) as ComplianceRecord;
 }
 
 /**
  * Generate a standalone ZK compliance proof for a batch.
  */
-export async function generateComplianceProof(batchId: string): Promise<ZKProof> {
-  const batch = stmts.getBatch().get(batchId) as PayrollBatch | undefined;
+export async function generateComplianceProof(
+  batchId: string,
+  workspaceId: string,
+): Promise<ZKProof> {
+  const batch = stmts.getBatch().get(batchId, workspaceId) as PayrollBatch | undefined;
   if (!batch) throw new ComplianceError(`Batch ${batchId} not found`);
   if (batch.status !== 'completed') {
     throw new ComplianceError(`Batch ${batchId} must be completed before proof generation.`);
@@ -191,22 +218,22 @@ export async function generateComplianceProof(batchId: string): Promise<ZKProof>
     commitmentRoot: batch.commitment_root,
   });
 
-  logAudit(uuid(), 'compliance.proof.generated', 'system', `Batch ${batchId}`);
+  logAudit(uuid(), 'compliance.proof.generated', workspaceId, `Batch ${batchId}`);
   return proof;
 }
 
 /**
  * Get the latest compliance status for a batch.
  */
-export function getComplianceStatus(batchId: string): ComplianceRecord | null {
-  return (stmts.getComplianceByBatch().get(batchId) as ComplianceRecord) ?? null;
+export function getComplianceStatus(batchId: string, workspaceId: string): ComplianceRecord | null {
+  return (stmts.getComplianceByBatch().get(batchId, workspaceId) as ComplianceRecord) ?? null;
 }
 
-export function getComplianceOverview(): {
+export function getComplianceOverview(workspaceId: string): {
   batches: ComplianceOverviewBatch[];
   stats: ComplianceOverviewStats;
 } {
-  const batches = stmts.getComplianceOverviewRows().all() as Array<{
+  const batches = stmts.getComplianceOverviewRows().all(workspaceId) as Array<{
     batch_id: string;
     created_at: string;
     total_amount: number;
@@ -254,74 +281,79 @@ export function getComplianceOverview(): {
 // Allowlist management
 // ────────────────────────────────────────────────────────────────────────────
 
-export function addToAllowlist(address: string, addedBy: string): AllowlistEntry {
+export function addToAllowlist(
+  address: string,
+  addedBy: string,
+  workspaceId: string,
+): AllowlistEntry {
   const normalizedAddress = normalizeWalletAddress(address);
-  const existing = stmts.findAllow().get(normalizedAddress) as AllowlistEntry | undefined;
+  const existing = stmts.findAllow().get(workspaceId, normalizedAddress) as AllowlistEntry | undefined;
   if (existing) throw new ComplianceError(`Address ${normalizedAddress} is already on the allowlist.`);
-  if (stmts.findBlock().get(normalizedAddress)) {
+  if (stmts.findBlock().get(workspaceId, normalizedAddress)) {
     throw new ComplianceError(`Address ${normalizedAddress} must be removed from the blocklist first.`);
   }
 
   const id = uuid();
-  stmts.insertAllow().run(id, normalizedAddress, addedBy);
-  logAudit(uuid(), 'allowlist.add', addedBy, normalizedAddress);
-  return stmts.findAllow().get(normalizedAddress) as AllowlistEntry;
+  stmts.insertAllow().run(id, workspaceId, normalizedAddress, addedBy);
+  logAudit(uuid(), 'allowlist.add', workspaceId, `${addedBy}: ${normalizedAddress}`);
+  return stmts.findAllow().get(workspaceId, normalizedAddress) as AllowlistEntry;
 }
 
-export function removeFromAllowlist(address: string): void {
+export function removeFromAllowlist(address: string, workspaceId: string): void {
   const normalizedAddress = normalizeWalletAddress(address);
-  const result = stmts.deleteAllow().run(normalizedAddress);
+  const result = stmts.deleteAllow().run(workspaceId, normalizedAddress);
   if (result.changes === 0) throw new ComplianceError(`Address ${normalizedAddress} not found on allowlist.`);
-  logAudit(uuid(), 'allowlist.remove', 'system', normalizedAddress);
+  logAudit(uuid(), 'allowlist.remove', workspaceId, normalizedAddress);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Blocklist management
 // ────────────────────────────────────────────────────────────────────────────
 
-export function addToBlocklist(address: string, reason: string, addedBy: string): BlocklistEntry {
+export function addToBlocklist(
+  address: string,
+  reason: string,
+  addedBy: string,
+  workspaceId: string,
+): BlocklistEntry {
   const normalizedAddress = normalizeWalletAddress(address);
-  const existing = stmts.findBlock().get(normalizedAddress) as BlocklistEntry | undefined;
+  const existing = stmts.findBlock().get(workspaceId, normalizedAddress) as BlocklistEntry | undefined;
   if (existing) throw new ComplianceError(`Address ${normalizedAddress} is already on the blocklist.`);
-  if (stmts.findAllow().get(normalizedAddress)) {
+  if (stmts.findAllow().get(workspaceId, normalizedAddress)) {
     throw new ComplianceError(`Address ${normalizedAddress} must be removed from the allowlist first.`);
   }
 
   const id = uuid();
-  stmts.insertBlock().run(id, normalizedAddress, reason, addedBy);
-  logAudit(uuid(), 'blocklist.add', addedBy, `${normalizedAddress} — ${reason}`);
-  return stmts.findBlock().get(normalizedAddress) as BlocklistEntry;
+  stmts.insertBlock().run(id, workspaceId, normalizedAddress, reason, addedBy);
+  logAudit(uuid(), 'blocklist.add', workspaceId, `${addedBy}: ${normalizedAddress} - ${reason}`);
+  return stmts.findBlock().get(workspaceId, normalizedAddress) as BlocklistEntry;
 }
 
-export function removeFromBlocklist(address: string): void {
+export function removeFromBlocklist(address: string, workspaceId: string): void {
   const normalizedAddress = normalizeWalletAddress(address);
-  const result = stmts.deleteBlock().run(normalizedAddress);
+  const result = stmts.deleteBlock().run(workspaceId, normalizedAddress);
   if (result.changes === 0) throw new ComplianceError(`Address ${normalizedAddress} not found on blocklist.`);
-  logAudit(uuid(), 'blocklist.remove', 'system', normalizedAddress);
+  logAudit(uuid(), 'blocklist.remove', workspaceId, normalizedAddress);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Lists & Audit
 // ────────────────────────────────────────────────────────────────────────────
 
-export function getLists(): { allowlist: AllowlistEntry[]; blocklist: BlocklistEntry[] } {
+export function getLists(workspaceId: string): { allowlist: AllowlistEntry[]; blocklist: BlocklistEntry[] } {
   return {
-    allowlist: stmts.getAllow().all() as AllowlistEntry[],
-    blocklist: stmts.getBlock().all() as BlocklistEntry[],
+    allowlist: stmts.getAllow().all(workspaceId) as AllowlistEntry[],
+    blocklist: stmts.getBlock().all(workspaceId) as BlocklistEntry[],
   };
 }
 
-export function getAuditTrail(filters: AuditFilter = {}): AuditLog[] {
-  const conditions: string[] = [];
-  const params: unknown[] = [];
+export function getAuditTrail(workspaceId: string, filters: AuditFilter = {}): AuditLog[] {
+  const conditions: string[] = ['actor = ?'];
+  const params: unknown[] = [workspaceId];
 
   if (filters.action) {
     conditions.push('action = ?');
     params.push(filters.action);
-  }
-  if (filters.actor) {
-    conditions.push('actor = ?');
-    params.push(filters.actor);
   }
   if (filters.from) {
     conditions.push('timestamp >= ?');

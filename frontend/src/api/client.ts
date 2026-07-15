@@ -1,4 +1,5 @@
 import { API_BASE } from '../config';
+import { getOrCreateWorkspaceToken } from '../workspace/session';
 
 interface ApiResponse<T> {
   success: boolean;
@@ -180,11 +181,15 @@ async function parseResponse<T>(response: Response): Promise<T> {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   try {
+    const requiresWorkspace = path.startsWith('/employer/') || path.startsWith('/compliance/');
     const response = await fetch(`${API_BASE}${path}`, {
       cache: 'no-store',
       ...init,
       headers: {
         ...(init?.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
+        ...(requiresWorkspace
+          ? { 'X-VeilPay-Workspace': getOrCreateWorkspaceToken() }
+          : {}),
         ...(init?.headers ?? {}),
       },
     });
@@ -202,10 +207,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 }
 
-export async function uploadPayrollCsv(file: File, employerId: string): Promise<UploadPayrollResponse> {
+export async function uploadPayrollCsv(file: File): Promise<UploadPayrollResponse> {
   const formData = new FormData();
   formData.append('file', file);
-  formData.append('employerId', employerId);
   return request<UploadPayrollResponse>('/employer/payroll/upload', {
     method: 'POST',
     body: formData,
@@ -219,17 +223,13 @@ export async function executePayroll(batchId: string): Promise<ExecutePayrollRes
   });
 }
 
-export async function getPayrollHistory(employerId: string): Promise<PayrollBatch[]> {
-  const data = await request<{ batches: PayrollBatch[] }>(
-    `/employer/payroll/history?employerId=${encodeURIComponent(employerId)}`,
-  );
+export async function getPayrollHistory(): Promise<PayrollBatch[]> {
+  const data = await request<{ batches: PayrollBatch[] }>('/employer/payroll/history');
   return data.batches;
 }
 
-export async function getDashboardStats(employerId: string): Promise<DashboardStats> {
-  return request<DashboardStats>(
-    `/employer/dashboard/stats?employerId=${encodeURIComponent(employerId)}`,
-  );
+export async function getDashboardStats(): Promise<DashboardStats> {
+  return request<DashboardStats>('/employer/dashboard/stats');
 }
 
 export async function getSystemHealth(): Promise<SystemHealth> {

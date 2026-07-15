@@ -23,6 +23,7 @@ import {
 } from '../services/compliance.js';
 import type { ApiResponse, AuditFilter } from '../types/index.js';
 import { isSupportedWalletAddress } from '../utils/wallet-address.js';
+import { getWorkspaceId } from '../middleware/workspace.js';
 
 const router = Router();
 
@@ -95,7 +96,7 @@ router.post('/check', async (req: Request, res: Response, next: NextFunction) =>
       return;
     }
 
-    const record = await checkCompliance(parsed.data.batchId);
+    const record = await checkCompliance(parsed.data.batchId, getWorkspaceId(res));
     sendJson(res, record);
   } catch (err) {
     if (err instanceof ComplianceError) {
@@ -117,7 +118,7 @@ router.get('/status/:batchId', (req: Request, res: Response, next: NextFunction)
       return;
     }
 
-    const record = getComplianceStatus(parsed.data.batchId);
+    const record = getComplianceStatus(parsed.data.batchId, getWorkspaceId(res));
     if (!record) {
       sendError(res, 404, `No compliance record found for batch ${parsed.data.batchId}`);
       return;
@@ -133,7 +134,7 @@ router.get('/status/:batchId', (req: Request, res: Response, next: NextFunction)
  */
 router.get('/overview', (_req: Request, res: Response, next: NextFunction) => {
   try {
-    sendJson(res, getComplianceOverview());
+    sendJson(res, getComplianceOverview(getWorkspaceId(res)));
   } catch (err) {
     next(err);
   }
@@ -154,7 +155,7 @@ router.post('/allowlist', (req: Request, res: Response, next: NextFunction) => {
       return;
     }
 
-    const entry = addToAllowlist(parsed.data.address, parsed.data.addedBy);
+    const entry = addToAllowlist(parsed.data.address, parsed.data.addedBy, getWorkspaceId(res));
     sendJson(res, entry);
   } catch (err) {
     if (err instanceof ComplianceError) {
@@ -176,7 +177,7 @@ router.delete('/allowlist/:address', (req: Request, res: Response, next: NextFun
       return;
     }
 
-    removeFromAllowlist(parsed.data.address);
+    removeFromAllowlist(parsed.data.address, getWorkspaceId(res));
     sendJson(res, { removed: parsed.data.address });
   } catch (err) {
     if (err instanceof ComplianceError) {
@@ -202,7 +203,12 @@ router.post('/blocklist', (req: Request, res: Response, next: NextFunction) => {
       return;
     }
 
-    const entry = addToBlocklist(parsed.data.address, parsed.data.reason, parsed.data.addedBy);
+    const entry = addToBlocklist(
+      parsed.data.address,
+      parsed.data.reason,
+      parsed.data.addedBy,
+      getWorkspaceId(res),
+    );
     sendJson(res, entry);
   } catch (err) {
     if (err instanceof ComplianceError) {
@@ -224,7 +230,7 @@ router.delete('/blocklist/:address', (req: Request, res: Response, next: NextFun
       return;
     }
 
-    removeFromBlocklist(parsed.data.address);
+    removeFromBlocklist(parsed.data.address, getWorkspaceId(res));
     sendJson(res, { removed: parsed.data.address });
   } catch (err) {
     if (err instanceof ComplianceError) {
@@ -246,7 +252,7 @@ router.delete('/blocklist/:address', (req: Request, res: Response, next: NextFun
  */
 router.get('/lists', (_req: Request, res: Response, next: NextFunction) => {
   try {
-    const lists = getLists();
+    const lists = getLists(getWorkspaceId(res));
     sendJson(res, lists);
   } catch (err) {
     next(err);
@@ -264,7 +270,7 @@ router.get('/audit', (req: Request, res: Response, next: NextFunction) => {
       return;
     }
 
-    const logs = getAuditTrail(parsed.data as AuditFilter);
+    const logs = getAuditTrail(getWorkspaceId(res), parsed.data as AuditFilter);
     sendJson(res, { logs, count: logs.length });
   } catch (err) {
     next(err);
@@ -288,7 +294,7 @@ router.post('/proof/generate', async (req: Request, res: Response, next: NextFun
       return;
     }
 
-    const proof = await generateComplianceProof(parsed.data.batchId);
+    const proof = await generateComplianceProof(parsed.data.batchId, getWorkspaceId(res));
     sendJson(res, proof);
   } catch (err) {
     if (err instanceof ComplianceError) {

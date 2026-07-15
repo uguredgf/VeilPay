@@ -6,8 +6,6 @@ import midnightService, { MidnightConfigurationError } from '../services/midnigh
 import {
   acquireClaimWithdrawalLock,
   getClaimRecordBySecretKey,
-  getEmployeeBalance,
-  getEmployeePayments,
   markClaimAsWithdrawn,
   releaseClaimWithdrawalLock,
   verifyClaimKey,
@@ -16,10 +14,6 @@ import type { ApiResponse } from '../types/index.js';
 import { isSupportedWalletAddress, normalizeWalletAddress } from '../utils/wallet-address.js';
 
 const router = Router();
-
-const AddressParamSchema = z.object({
-  address: z.string().trim().refine(isSupportedWalletAddress, 'A valid Midnight or demo wallet address is required'),
-});
 
 const ClaimVerifySchema = z.object({
   secretKey: z.string().min(1, 'Secret key is required'),
@@ -94,7 +88,7 @@ router.post('/claim/withdraw', async (req: Request, res: Response, next: NextFun
       itemId: claim.itemId,
       nullifier: claim.nullifier,
       amount: claim.amount,
-        walletAddress: normalizeWalletAddress(parsed.data.walletAddress),
+      walletAddress: normalizeWalletAddress(parsed.data.walletAddress),
     });
 
     const txResult = await midnightService.callCircuit(
@@ -116,8 +110,8 @@ router.post('/claim/withdraw', async (req: Request, res: Response, next: NextFun
     logAudit(
       uuid(),
       'employee.withdraw',
-      claim.employeeName,
-      `Withdraw ${claim.amount} to ${withdrawalAddress} with tx ${txResult.txHash}`,
+      claim.employerId,
+      `Claim ${claim.itemId} withdrew ${claim.amount} with tx ${txResult.txHash}`,
     );
 
     sendJson(res, {
@@ -134,48 +128,6 @@ router.post('/claim/withdraw', async (req: Request, res: Response, next: NextFun
       sendError(res, error.statusCode, error.message, error.details);
       return;
     }
-    next(error);
-  }
-});
-
-router.get('/:address/balance', (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const parsed = AddressParamSchema.safeParse(req.params);
-    if (!parsed.success) {
-      sendError(res, 400, parsed.error.errors.map((error) => error.message).join('; '));
-      return;
-    }
-
-    sendJson(res, getEmployeeBalance(normalizeWalletAddress(parsed.data.address)));
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.get('/:address/payments', (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const parsed = AddressParamSchema.safeParse(req.params);
-    if (!parsed.success) {
-      sendError(res, 400, parsed.error.errors.map((error) => error.message).join('; '));
-      return;
-    }
-
-    sendJson(res, { payments: getEmployeePayments(normalizeWalletAddress(parsed.data.address)) });
-  } catch (error) {
-    next(error);
-  }
-});
-
-router.get('/:address/history', (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const parsed = AddressParamSchema.safeParse(req.params);
-    if (!parsed.success) {
-      sendError(res, 400, parsed.error.errors.map((error) => error.message).join('; '));
-      return;
-    }
-
-    sendJson(res, { history: getEmployeePayments(normalizeWalletAddress(parsed.data.address)) });
-  } catch (error) {
     next(error);
   }
 });

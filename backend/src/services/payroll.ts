@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { v4 as uuid } from 'uuid';
 import db, { logAudit } from '../database/init.js';
 import midnightService from './midnight.js';
@@ -19,7 +20,6 @@ import type {
   CSVParseResult,
   DashboardStats,
   Employee,
-  EmployeeBalance,
   PayrollBatch,
   PayrollBatchStatus,
   PayrollItem,
@@ -74,46 +74,19 @@ const stmts = {
 
   getBatchItems: () => db.prepare('SELECT * FROM payroll_items WHERE batch_id = ?'),
 
-  getBatchItemsWithEmployees: () =>
-    db.prepare(`
-      SELECT
-        pi.*,
-        e.name AS employee_name,
-        e.wallet_address AS employee_wallet_address
-      FROM payroll_items pi
-      JOIN employees e ON e.id = pi.employee_id
-      WHERE pi.batch_id = ?
-      ORDER BY e.name ASC
-    `),
-
   getEmployerBatches: () =>
     db.prepare('SELECT * FROM payroll_batches WHERE employer_id = ? ORDER BY created_at DESC'),
 
   getEmployeeByWallet: () => db.prepare('SELECT * FROM employees WHERE wallet_address = ?'),
 
-  getItemsByEmployee: () =>
-    db.prepare(`
-      SELECT
-        pi.*,
-        pb.created_at AS batch_date,
-        pb.status AS batch_status
-      FROM payroll_items pi
-      JOIN payroll_batches pb ON pi.batch_id = pb.id
-      JOIN employees e ON pi.employee_id = e.id
-      WHERE e.wallet_address = ?
-      ORDER BY pb.created_at DESC
-    `),
-
   getClaimByHash: () =>
     db.prepare(`
       SELECT
         pi.*,
-        e.name AS employee_name,
-        e.wallet_address AS employee_wallet_address,
+        pb.employer_id AS employer_id,
         pb.status AS batch_status,
         pb.created_at AS batch_created_at
       FROM payroll_items pi
-      JOIN employees e ON e.id = pi.employee_id
       JOIN payroll_batches pb ON pb.id = pi.batch_id
       WHERE pi.claim_key_hash = ?
       LIMIT 1
@@ -148,14 +121,21 @@ const stmts = {
 };
 
 interface ClaimLookupRow extends PayrollItem {
-  employee_name: string;
-  employee_wallet_address: string;
+  employer_id: string;
   batch_status: PayrollBatchStatus;
   batch_created_at: string;
 }
 
 export interface ResolvedClaimRecord extends ClaimVerificationResult {
   nullifier: string;
+  employerId: string;
+}
+
+function getPrivateEmployeeReference(workspaceId: string, walletAddress: string): string {
+  const digest = createHash('sha256')
+    .update(`${workspaceId}\0${walletAddress.toLowerCase()}`, 'utf8')
+    .digest('hex');
+  return `private:${digest}`;
 }
 
 export function createPayrollBatch(
@@ -182,9 +162,10 @@ export function createPayrollBatch(
 
     for (const row of parsed.items) {
       const employeeId = uuid();
-      stmts.upsertEmployee().run(employeeId, row.name, row.wallet_address, row.department ?? null);
+      const privateReference = getPrivateEmployeeReference(employerId, row.wallet_address);
+      stmts.upsertEmployee().run(employeeId, 'Encrypted employee', privateReference, null);
 
-      const employee = stmts.getEmployeeByWallet().get(row.wallet_address) as Employee;
+      const employee = stmts.getEmployeeByWallet().get(privateReference) as Employee;
       const secret = generateSecret();
       const commitment = generateCommitment(secret, row.amount);
       const nullifier = generateNullifier(commitment, secret);
@@ -192,8 +173,8 @@ export function createPayrollBatch(
       const claimPayload: ClaimPayload = {
         claimKey,
         employeeId: employee.id,
-        employeeName: employee.name,
-        walletAddress: employee.wallet_address,
+        employeeName: row.name,
+        walletAddress: row.wallet_address,
         batchId,
         amount: row.amount,
         generatedAt: new Date().toISOString(),
@@ -227,9 +208,12 @@ export function createPayrollBatch(
   };
 }
 
-export async function executePayrollBatch(batchId: string): Promise<PayrollBatch> {
+export async function executePayrollBatch(
+  batchId: string,
+  employerId: string,
+): Promise<PayrollBatch> {
   const batch = stmts.getBatch().get(batchId) as PayrollBatch | undefined;
-  if (!batch) {
+  if (!batch || batch.employer_id !== employerId) {
     throw new PayrollError(`Batch ${batchId} not found`);
   }
   if (batch.status !== 'pending') {
@@ -298,9 +282,12 @@ type PublicPayrollItem = Pick<
   | 'withdrawal_address'
 >;
 
-export function getBatchDetails(batchId: string): { batch: PayrollBatch; items: PublicPayrollItem[] } {
+export function getBatchDetails(
+  batchId: string,
+  employerId: string,
+): { batch: PayrollBatch; items: PublicPayrollItem[] } {
   const batch = stmts.getBatch().get(batchId) as PayrollBatch | undefined;
-  if (!batch) {
+  if (!batch || batch.employer_id !== employerId) {
     throw new PayrollError(`Batch ${batchId} not found`);
   }
 
@@ -320,13 +307,16 @@ export function getBatchDetails(batchId: string): { batch: PayrollBatch; items: 
   };
 }
 
-export function getBatchClaimDistribution(batchId: string): BatchClaimDistribution[] {
-  const rows = stmts.getBatchItemsWithEmployees().all(batchId) as Array<
-    PayrollItem & {
-      employee_name: string;
-      employee_wallet_address: string;
-    }
-  >;
+export function getBatchClaimDistribution(
+  batchId: string,
+  employerId: string,
+): BatchClaimDistribution[] {
+  const batch = stmts.getBatch().get(batchId) as PayrollBatch | undefined;
+  if (!batch || batch.employer_id !== employerId) {
+    throw new PayrollError(`Batch ${batchId} not found`);
+  }
+
+  const rows = stmts.getBatchItems().all(batchId) as PayrollItem[];
 
   return rows.map((row) => {
     if (!row.encrypted_data) {
@@ -337,14 +327,14 @@ export function getBatchClaimDistribution(batchId: string): BatchClaimDistributi
     return {
       itemId: row.id,
       employeeId: row.employee_id,
-      employeeName: row.employee_name,
-      walletAddress: row.employee_wallet_address,
+      employeeName: payload.employeeName,
+      walletAddress: payload.walletAddress,
       amount: row.amount,
       claimKey: payload.claimKey,
       claimKeyLast4: payload.claimKey.slice(-4),
       status: row.status,
     };
-  });
+  }).sort((left, right) => left.employeeName.localeCompare(right.employeeName));
 }
 
 export function getDashboardStats(employerId: string): DashboardStats {
@@ -367,51 +357,19 @@ export function getDashboardStats(employerId: string): DashboardStats {
   };
 }
 
-export function getEmployeeBalance(address: string): EmployeeBalance {
-  const employee = stmts.getEmployeeByWallet().get(address) as Employee | undefined;
-  if (!employee) {
-    return { address, available: 0, pending: 0, totalReceived: 0 };
-  }
-
-  const items = stmts.getItemsByEmployee().all(address) as Array<
-    PayrollItem & { batch_status: PayrollBatchStatus }
-  >;
-
-  const available = items
-    .filter((item) => item.status === 'pending' && item.batch_status === 'completed')
-    .reduce((sum, item) => sum + item.amount, 0);
-
-  const pending = items
-    .filter((item) => item.batch_status === 'pending' || item.batch_status === 'processing')
-    .reduce((sum, item) => sum + item.amount, 0);
-
-  const claimed = items
-    .filter((item) => item.status === 'claimed')
-    .reduce((sum, item) => sum + item.amount, 0);
-
-  return {
-    address,
-    available,
-    pending,
-    totalReceived: available + pending + claimed,
-  };
-}
-
-export function getEmployeePayments(address: string): PayrollItem[] {
-  return stmts.getItemsByEmployee().all(address) as PayrollItem[];
-}
-
 export function getClaimRecordBySecretKey(secretKey: string): ResolvedClaimRecord | null {
   const row = stmts.getClaimByHash().get(hashClaimKey(secretKey.trim())) as ClaimLookupRow | undefined;
-  if (!row || !row.nullifier) {
+  if (!row || !row.nullifier || !row.encrypted_data) {
     return null;
   }
+
+  const payload = decryptClaimPayload(row.encrypted_data);
 
   return {
     itemId: row.id,
     employeeId: row.employee_id,
-    employeeName: row.employee_name,
-    walletAddress: row.employee_wallet_address,
+    employeeName: payload.employeeName,
+    walletAddress: payload.walletAddress,
     amount: row.amount,
     batchId: row.batch_id,
     batchStatus: row.batch_status,
@@ -419,6 +377,7 @@ export function getClaimRecordBySecretKey(secretKey: string): ResolvedClaimRecor
     claimable: row.status === 'pending' && row.batch_status === 'completed',
     createdAt: row.batch_created_at,
     nullifier: row.nullifier,
+    employerId: row.employer_id,
   };
 }
 
@@ -428,7 +387,7 @@ export function verifyClaimKey(secretKey: string): ClaimVerificationResult | nul
     return null;
   }
 
-  const { nullifier: _nullifier, ...result } = claim;
+  const { nullifier: _nullifier, employerId: _employerId, ...result } = claim;
   return result;
 }
 
