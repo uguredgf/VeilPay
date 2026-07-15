@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: veilpay-demo
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: MIDNIGHT_EXECUTION_MODE
+        value: simulation
+      - key: MIDNIGHT_NETWORK
+        value: testnet
+      - key: MIDNIGHT_INDEXER_URL
+        value: simulation://indexer
+      - key: MIDNIGHT_NODE_URL
+        value: simulation://node
+      - key: MIDNIGHT_PROOF_SERVER_URL
+        value: simulation://proof-server
+      - key: DATABASE_PATH
+        value: /tmp/veilpay.db
+      - key: CLAIM_ENCRYPTION_SECRET
+        generateValue: true
+      - key: LOG_FORMAT
+        value: combined

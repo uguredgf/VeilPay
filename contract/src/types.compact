@@ -1,0 +1,218 @@
+// ============================================================================
+// VeilPay — Shared Type Definitions
+// ============================================================================
+// STATUS: ARCHITECTURE DRAFT. This file has not been compiled with the current
+// official Compact toolchain and must not be represented as deployable code.
+// This module defines all shared data structures used across the VeilPay
+// payroll system contracts. Types are designed for Midnight's dual-state
+// ledger architecture where public state lives on-chain and private state
+// remains on the user's local device, proven via ZK-SNARKs.
+//
+// PRIVACY MODEL:
+//   - Addresses are public identifiers (Bytes<32>)
+//   - Commitments hide the relationship between employee + amount
+//   - Nullifiers prevent double-spending without revealing which commitment
+//   - Encrypted amounts are only decryptable by the intended recipient
+//   - Merkle proofs demonstrate set membership without revealing the set
+// ============================================================================
+
+pragma language_version 0.23;
+
+// ---------------------------------------------------------------------------
+// Section 1: Primitive Type Aliases
+// ---------------------------------------------------------------------------
+
+// A 32-byte address on the Midnight Network (BLS12-381 public key hash).
+// Used for both employer and employee identifiers.
+type Address = Bytes<32>;
+
+// A Pedersen commitment: commit(amount, blinding_factor).
+// Hides the amount while allowing arithmetic verification in ZK.
+// The commitment scheme ensures: given C = commit(v, r), one cannot
+// extract v without knowing r, but can prove properties of v in a circuit.
+type Commitment = Bytes<32>;
+
+// A nullifier derived from a secret and commitment.
+// Once published on-chain, it marks a commitment as "spent" without
+// revealing which commitment it corresponds to.
+// Derived as: nullifier = hash(secret || commitment_index)
+type Nullifier = Bytes<32>;
+
+// A hash digest used for Merkle tree nodes and roots.
+// We use the Compact standard library's hash function (Poseidon-based
+// over BLS12-381 scalar field) for ZK-friendly Merkle trees.
+type HashDigest = Bytes<32>;
+
+// Salt for commitment randomness — prevents rainbow-table attacks
+// on commitment values.
+type Salt = Bytes<32>;
+
+// Opaque string type for human-readable metadata that stays off-chain.
+// Used in audit logs and batch descriptions.
+type Label = Opaque<"string">;
+
+
+// ---------------------------------------------------------------------------
+// Section 2: Employee Record
+// ---------------------------------------------------------------------------
+// An employee record binds an address to a payment commitment.
+// The actual salary amount is NEVER stored in plaintext on-chain.
+//
+// Privacy guarantees:
+//   - `address` is known to the employer (private witness in most circuits)
+//   - `commitment` is the Pedersen commitment to (amount, blinding_factor)
+//   - `encryptedAmount` is encrypted under the employee's public key so
+//     only the employee can decrypt and learn their salary
+//   - `index` is the leaf position in the Merkle tree
+
+struct Employee {
+  address: Address;          // Employee's Midnight address
+  commitment: Commitment;    // commit(salary_amount, blinding_factor)
+  encryptedAmount: Bytes<32>; // Salary encrypted under employee's pub key
+  index: Uint<64>;           // Leaf index in the commitment Merkle tree
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 3: Payroll Batch
+// ---------------------------------------------------------------------------
+// A payroll batch groups multiple employee payments into a single
+// on-chain transaction. Only the aggregate total and the Merkle root
+// of all commitments are disclosed publicly. Individual salaries remain
+// private.
+//
+// Workflow:
+//   1. Employer constructs Employee records off-chain
+//   2. Employer builds a Merkle tree of commitments
+//   3. Employer calls deposit() with the batch — only totalAmount and
+//      the new Merkle root are disclosed on the public ledger
+//   4. Each employee later calls withdraw() with their secret to claim
+
+struct PayrollBatch {
+  batchId: Uint<64>;           // Unique monotonic batch identifier
+  merkleRoot: HashDigest;      // Root of the commitment tree for this batch
+  totalAmount: Uint<64>;       // Sum of all employee payments in this batch
+  employeeCount: Uint<64>;     // Number of employees in the batch
+  timestamp: Uint<64>;         // Block timestamp when batch was created
+  salt: Salt;                  // Randomness to prevent batch fingerprinting
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 4: Merkle Tree Types
+// ---------------------------------------------------------------------------
+// The commitment Merkle tree is a binary tree of depth 20, supporting
+// up to 2^20 = 1,048,576 leaf commitments. Each leaf is a Pedersen
+// commitment. Internal nodes are Poseidon hashes of their children.
+//
+// The tree enables efficient ZK membership proofs: an employee can prove
+// their commitment is in the tree by providing a Merkle path (20 sibling
+// hashes) without revealing which leaf is theirs.
+
+// A single sibling node in a Merkle authentication path.
+// `hash` is the sibling's hash value.
+// `position` indicates whether the sibling is on the left (0) or right (1).
+struct MerkleNode {
+  hash: HashDigest;       // Hash of the sibling node
+  position: Uint<64>;     // 0 = left sibling, 1 = right sibling
+}
+
+// A complete Merkle proof (authentication path) for a leaf.
+// Contains exactly MERKLE_DEPTH sibling hashes to reconstruct
+// the path from leaf to root. The depth is fixed at 20 for our tree.
+//
+// NOTE: In Compact, fixed-size arrays are not directly supported,
+// so we represent the path as individual nodes. In practice, the
+// circuit unrolls the verification loop for the fixed depth.
+struct MerkleProof {
+  leaf: Commitment;         // The commitment being proven
+  pathNode0: HashDigest;    // Sibling hash at depth 0 (leaf level)
+  pathNode1: HashDigest;    // Sibling hash at depth 1
+  pathNode2: HashDigest;    // Sibling hash at depth 2
+  pathNode3: HashDigest;    // Sibling hash at depth 3
+  pathNode4: HashDigest;    // Sibling hash at depth 4
+  pathNode5: HashDigest;    // Sibling hash at depth 5
+  pathNode6: HashDigest;    // Sibling hash at depth 6
+  pathNode7: HashDigest;    // Sibling hash at depth 7
+  pathNode8: HashDigest;    // Sibling hash at depth 8
+  pathNode9: HashDigest;    // Sibling hash at depth 9
+  pathNode10: HashDigest;   // Sibling hash at depth 10
+  pathNode11: HashDigest;   // Sibling hash at depth 11
+  pathNode12: HashDigest;   // Sibling hash at depth 12
+  pathNode13: HashDigest;   // Sibling hash at depth 13
+  pathNode14: HashDigest;   // Sibling hash at depth 14
+  pathNode15: HashDigest;   // Sibling hash at depth 15
+  pathNode16: HashDigest;   // Sibling hash at depth 16
+  pathNode17: HashDigest;   // Sibling hash at depth 17
+  pathNode18: HashDigest;   // Sibling hash at depth 18
+  pathNode19: HashDigest;   // Sibling hash at depth 19
+  pathBits: Uint<64>;       // Bit-packed left/right directions (20 bits)
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 5: Compliance Proof Structure
+// ---------------------------------------------------------------------------
+// A compliance proof demonstrates that a payroll batch satisfies
+// regulatory requirements WITHOUT revealing individual employee data.
+//
+// The proof attests to:
+//   - All employees are on the allowlist (KYC/AML verified)
+//   - No employee is on the blocklist (sanctions screening)
+//   - No single payment exceeds the per-transaction regulatory cap
+//   - The batch total does not exceed the aggregate regulatory limit
+//
+// The proof itself is generated by the compliance circuit and verified
+// on-chain. The regulator sees only the boolean result and aggregate
+// statistics, never individual salaries.
+
+struct ComplianceProof {
+  batchId: Uint<64>;            // Which payroll batch this proof covers
+  isCompliant: Uint<64>;        // 1 = compliant, 0 = non-compliant
+  totalVerified: Uint<64>;      // Total amount verified (can be disclosed)
+  employeeCount: Uint<64>;      // Number of employees verified
+  timestamp: Uint<64>;          // When the compliance check was performed
+  proofHash: HashDigest;        // Hash of the full proof data for audit trail
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 6: Audit Log Entry
+// ---------------------------------------------------------------------------
+// Audit log entries provide a tamper-evident trail for regulators.
+// Each entry records that a compliance check occurred and its result,
+// without exposing the underlying employee data.
+
+struct AuditEntry {
+  entryId: Uint<64>;            // Monotonic audit entry identifier
+  batchId: Uint<64>;            // Associated payroll batch
+  timestamp: Uint<64>;          // When the audit entry was created
+  complianceResult: Uint<64>;   // 1 = passed, 0 = failed
+  proofHash: HashDigest;        // Hash linking to the full ZK proof
+  auditorAddress: Address;      // Who initiated the audit check
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 7: Token Types
+// ---------------------------------------------------------------------------
+// Types specific to the shielded payroll token wrapper.
+// These extend Midnight's native token with payroll-specific metadata.
+
+// A shielded token balance note. Similar to a UTXO — each note represents
+// a specific amount owned by a specific address, hidden behind a commitment.
+struct TokenNote {
+  owner: Address;               // Owner's address (private)
+  amount: Uint<64>;             // Token amount (private)
+  salt: Salt;                   // Randomness for commitment uniqueness
+  commitment: Commitment;       // commit(owner || amount || salt)
+}
+
+// Transfer receipt — returned to the sender after a private transfer.
+// Contains enough information for the sender to verify the transfer
+// completed, but not enough for a third party to learn the details.
+struct TransferReceipt {
+  txHash: HashDigest;           // Hash of the transfer transaction
+  nullifier: Nullifier;         // Nullifier of the spent input note
+  timestamp: Uint<64>;          // Block timestamp of the transfer
+}

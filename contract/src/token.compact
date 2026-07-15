@@ -1,0 +1,564 @@
+// ============================================================================
+// VeilPay — Shielded Payroll Token Contract
+// ============================================================================
+// STATUS: ARCHITECTURE DRAFT. This file has not been compiled with the current
+// official Compact toolchain and must not be represented as deployable code.
+//
+// OVERVIEW:
+//   This contract wraps Midnight's native token infrastructure with
+//   payroll-specific functionality. It provides a shielded (privacy-
+//   preserving) ERC-20-equivalent token that integrates with the
+//   VeilPay payroll system.
+//
+// DESIGN PHILOSOPHY:
+//   Midnight Network's native token system already supports shielded
+//   transfers via the NIGHT/DUST dual-token economy. This contract
+//   extends that with:
+//     1. Admin-controlled minting for payroll pool funding
+//     2. Private transfers with ZK-proven sender authorization
+//     3. Shielded balance queries (owner can check without revealing)
+//     4. Integration points for the payroll and compliance contracts
+//
+// COMPATIBILITY:
+//   This contract is designed to be compatible with the OpenZeppelin
+//   Compact ERC-20 equivalent (once the library is published).
+//   Key interfaces:
+//     - mint(amount, recipient)     — Analogous to ERC-20 mint
+//     - transfer(from, to, amount)  — Analogous to ERC-20 transfer
+//     - balanceOf(owner)            — Analogous to ERC-20 balanceOf
+//
+//   The key difference from standard ERC-20 is that balances, transfer
+//   amounts, and sender/recipient identities can be selectively hidden
+//   behind ZK proofs.
+//
+// TOKEN MODEL:
+//   We use a UTXO-like note model (similar to Zcash's Sapling):
+//     - Each "note" is a tuple: (owner, amount, salt)
+//     - Notes are stored as commitments: hash(owner || amount || salt)
+//     - Spending a note requires revealing a nullifier (not the note)
+//     - Creating a new note adds a new commitment
+//
+//   This is more privacy-preserving than an account-balance model
+//   because individual transfers don't reveal cumulative balances.
+//
+// ============================================================================
+
+pragma language_version 0.23;
+
+
+// ============================================================================
+// LEDGER STATE — Public On-Chain State
+// ============================================================================
+
+export ledger {
+  // ---- Token Metadata ----
+
+  // Token name (stored as hash for on-chain compactness).
+  // The full name "VeilPay Token" is known off-chain.
+  tokenNameHash: Bytes<32>;
+
+  // Token symbol identifier hash.
+  // The draft symbol "VPAY" is known off-chain.
+  tokenSymbolHash: Bytes<32>;
+
+  // Total supply of tokens ever minted.
+  // This is a PUBLIC aggregate — individual holdings are private.
+  totalSupply: Uint<64>;
+
+  // Total tokens burned (if burn functionality is added).
+  totalBurned: Uint<64>;
+
+  // ---- Access Control ----
+
+  // The token administrator (minter). Only this address can mint new tokens.
+  // Typically the employer or a treasury contract.
+  tokenAdmin: Bytes<32>;
+
+  // Initialization flag.
+  isInitialized: Uint<64>;
+
+  // ---- UTXO Note Set ----
+
+  // Set of all note commitments that have been created (minted or
+  // received as transfer output). Each commitment hides (owner, amount, salt).
+  noteCommitments: Set<Bytes<32>>;
+
+  // Set of spent nullifiers. When a note is spent (transferred or
+  // withdrawn), its nullifier is published here to prevent double-spend.
+  spentNullifiers: Set<Bytes<32>>;
+
+  // Total count of notes ever created (for indexing/diagnostics).
+  noteCount: Uint<64>;
+
+  // ---- Merkle Tree for Note Commitments ----
+
+  // Root of the Merkle tree containing all note commitments.
+  // Used for membership proofs during transfers and withdrawals.
+  noteMerkleRoot: Bytes<32>;
+}
+
+
+// ============================================================================
+// CIRCUIT: initializeToken
+// ============================================================================
+// Sets up the shielded payroll token with admin and metadata.
+//
+// Parameters:
+//   admin     — The minter/admin address (DISCLOSED)
+//   nameHash  — Hash of the token name (DISCLOSED)
+//   symbolHash — Hash of the token symbol (DISCLOSED)
+//
+// This is intentionally transparent: token metadata and the minter
+// identity are public governance information.
+
+export circuit initializeToken(
+  admin: Bytes<32>,
+  nameHash: Bytes<32>,
+  symbolHash: Bytes<32>
+): [] {
+  // SECURITY: Prevent re-initialization.
+  assert(ledger.isInitialized == 0,
+    "Token contract already initialized");
+
+  // Token metadata is public — everyone should know what token this is.
+  disclose(admin);
+  disclose(nameHash);
+  disclose(symbolHash);
+
+  ledger.tokenAdmin = admin;
+  ledger.tokenNameHash = nameHash;
+  ledger.tokenSymbolHash = symbolHash;
+  ledger.isInitialized = 1;
+
+  // Initialize counters.
+  ledger.totalSupply = 0;
+  ledger.totalBurned = 0;
+  ledger.noteCount = 0;
+
+  // Initialize Merkle root to empty tree.
+  ledger.noteMerkleRoot = 0x0000000000000000000000000000000000000000000000000000000000000000;
+}
+
+
+// ============================================================================
+// CIRCUIT: mint
+// ============================================================================
+// Admin mints new tokens to a recipient.
+//
+// The minting event creates a new UTXO note committed to the recipient.
+// What goes PUBLIC:
+//   - The total supply increase (aggregate)
+//   - The note commitment (hides recipient and amount)
+// What stays PRIVATE:
+//   - The recipient address
+//   - The minted amount
+//   - The salt used for the commitment
+//
+// This means observers see "some tokens were minted" but don't know
+// how many or for whom — only the aggregate totalSupply changes.
+//
+// Parameters (PRIVATE by default):
+//   amount        — Number of tokens to mint
+//   recipient     — Address to receive the tokens
+//   salt          — Randomness for commitment uniqueness
+//   callerAddress — Must be admin
+//
+// Returns: the commitment hash of the new note
+
+export circuit mint(
+  amount: Uint<64>,
+  recipient: Bytes<32>,
+  salt: Bytes<32>,
+  callerAddress: Bytes<32>
+): Bytes<32> {
+  // ---- Security Checks ----
+  assert(ledger.isInitialized == 1,
+    "Token contract not initialized");
+  assert(callerAddress == ledger.tokenAdmin,
+    "Unauthorized: only the token admin can mint new tokens");
+  assert(amount > 0,
+    "Mint amount must be greater than zero");
+
+  // SECURITY: Overflow protection on total supply.
+  const MAX_SUPPLY: Uint<64> = 18446744073709551615; // 2^64 - 1
+  assert(ledger.totalSupply + amount <= MAX_SUPPLY,
+    "Mint would exceed maximum total supply");
+
+  // ---- Create Note Commitment ----
+
+  // Compute the commitment: hash(recipient || amount || salt)
+  // This hides the recipient and amount while binding them together.
+  // The salt ensures uniqueness even for repeated (recipient, amount) pairs.
+  const commitment: Bytes<32> = persistent_hash(
+    recipient,
+    pad(32, amount),
+    salt
+  );
+
+  // SECURITY: Verify commitment uniqueness (prevents collisions).
+  assert(commitment not_in ledger.noteCommitments,
+    "Commitment collision: this note commitment already exists. Use a different salt.");
+
+  // ---- State Updates ----
+
+  // Register the new note commitment.
+  ledger.noteCommitments = ledger.noteCommitments.insert(commitment);
+
+  // Update counters. The total supply change is PUBLIC — this is
+  // intentional for monetary policy transparency. However, the
+  // per-mint amount is NOT disclosed — only the cumulative total.
+  //
+  // In practice, if mints are infrequent, the supply change between
+  // blocks reveals the mint amount. For maximum privacy, multiple
+  // mints should be batched together.
+  ledger.totalSupply = ledger.totalSupply + amount;
+  ledger.noteCount = ledger.noteCount + 1;
+
+  // NOTE: We intentionally do NOT disclose the amount or recipient.
+  // The commitment goes on-chain (it's added to the set), but it
+  // reveals nothing about the underlying values.
+
+  // Return the commitment so the caller can share it with the recipient.
+  // The recipient needs the commitment (and the preimage values) to
+  // later spend this note.
+  return commitment;
+}
+
+
+// ============================================================================
+// CIRCUIT: transfer
+// ============================================================================
+// Private token transfer from one address to another.
+//
+// This implements a UTXO-style transfer:
+//   1. The sender "spends" an existing note by revealing its nullifier
+//   2. Two new notes are created:
+//      a. One for the recipient (with the transfer amount)
+//      b. One for the sender (with the change, if any)
+//
+// Privacy Analysis:
+//   DISCLOSED: sender's nullifier (for double-spend prevention)
+//   PRIVATE:   sender address, recipient address, transfer amount,
+//              input note details, output note details
+//
+// An observer sees: "A note was spent and two new notes were created"
+// but cannot determine who sent, who received, or how much.
+//
+// Parameters (PRIVATE by default):
+//   senderSecret      — Sender's secret (to derive nullifier)
+//   inputCommitment   — Commitment of the note being spent
+//   inputAmount       — Amount in the input note
+//   inputSalt         — Salt of the input note
+//   senderAddress     — Sender's address
+//   recipientAddress  — Recipient's address
+//   transferAmount    — Amount to transfer
+//   outputSalt1       — Salt for recipient's new note
+//   outputSalt2       — Salt for sender's change note
+//   callerAddress     — Transaction signer (must match sender)
+//
+// Security Properties:
+//   - Input note must exist (commitment in set)
+//   - Input note must not be already spent (nullifier check)
+//   - Sender must know the note preimage (commitment verification)
+//   - Transfer amount must not exceed input amount
+//   - Conservation: input amount = transfer amount + change amount
+
+export circuit transfer(
+  senderSecret: Bytes<32>,
+  inputCommitment: Bytes<32>,
+  inputAmount: Uint<64>,
+  inputSalt: Bytes<32>,
+  senderAddress: Bytes<32>,
+  recipientAddress: Bytes<32>,
+  transferAmount: Uint<64>,
+  outputSalt1: Bytes<32>,
+  outputSalt2: Bytes<32>,
+  callerAddress: Bytes<32>
+): [] {
+  // ---- Security Checks ----
+  assert(ledger.isInitialized == 1,
+    "Token contract not initialized");
+  assert(transferAmount > 0,
+    "Transfer amount must be greater than zero");
+  assert(transferAmount <= inputAmount,
+    "Transfer amount exceeds input note balance");
+
+  // Verify the caller is the sender (authorization).
+  assert(callerAddress == senderAddress,
+    "Unauthorized: caller must be the sender");
+
+  // ---- Verify Input Note Ownership ----
+
+  // Recompute the input commitment from the provided preimage.
+  // This proves the sender knows the secret values behind the commitment.
+  const recomputedInput: Bytes<32> = persistent_hash(
+    senderAddress,
+    pad(32, inputAmount),
+    inputSalt
+  );
+  assert(recomputedInput == inputCommitment,
+    "Input note verification failed: preimage does not match commitment");
+
+  // Verify the input commitment exists in the note set.
+  assert(inputCommitment in ledger.noteCommitments,
+    "Input note not found: commitment does not exist");
+
+  // ---- Double-Spend Prevention ----
+
+  // Compute and check the nullifier for the input note.
+  const inputNullifier: Bytes<32> = persistent_hash(
+    senderSecret,
+    inputCommitment
+  );
+  assert(inputNullifier not_in ledger.spentNullifiers,
+    "Double-spend detected: input note has already been spent");
+
+  // ---- Create Output Notes ----
+
+  // Output 1: Recipient's note with the transfer amount.
+  const recipientCommitment: Bytes<32> = persistent_hash(
+    recipientAddress,
+    pad(32, transferAmount),
+    outputSalt1
+  );
+
+  // Output 2: Sender's change note (input - transfer = change).
+  const changeAmount: Uint<64> = inputAmount - transferAmount;
+  const changeCommitment: Bytes<32> = persistent_hash(
+    senderAddress,
+    pad(32, changeAmount),
+    outputSalt2
+  );
+
+  // SECURITY: Verify commitment uniqueness for both outputs.
+  assert(recipientCommitment not_in ledger.noteCommitments,
+    "Recipient commitment collision: use a different salt");
+  assert(changeCommitment not_in ledger.noteCommitments,
+    "Change commitment collision: use a different salt");
+  assert(recipientCommitment != changeCommitment,
+    "Recipient and change commitments must be different");
+
+  // ---- Conservation Check ----
+
+  // CRITICAL: Verify that no tokens are created or destroyed.
+  // input amount = transfer amount + change amount
+  // This is the fundamental soundness property of the UTXO model.
+  assert(inputAmount == transferAmount + changeAmount,
+    "Conservation violation: input amount != transfer + change");
+
+  // ---- State Updates ----
+
+  // Mark the input note as spent.
+  disclose(inputNullifier);
+  ledger.spentNullifiers = ledger.spentNullifiers.insert(inputNullifier);
+
+  // Register the two new output notes.
+  ledger.noteCommitments = ledger.noteCommitments.insert(recipientCommitment);
+
+  // Only create a change note if there is change (optimization).
+  if (changeAmount > 0) {
+    ledger.noteCommitments = ledger.noteCommitments.insert(changeCommitment);
+    ledger.noteCount = ledger.noteCount + 2;
+  } else {
+    // No change — exact amount transfer. Only one new note.
+    ledger.noteCount = ledger.noteCount + 1;
+  }
+
+  // NOTE: totalSupply does NOT change — tokens are transferred, not created.
+  // This is a key property: observers see nullifier + new commitments
+  // but learn nothing about amounts or participants.
+}
+
+
+// ============================================================================
+// CIRCUIT: shieldedBalance
+// ============================================================================
+// Allows a token owner to query their balance without revealing it
+// to anyone else on the network.
+//
+// HOW IT WORKS:
+//   The owner provides their address and secret. The circuit computes
+//   the balance by checking which note commitments belong to the owner
+//   (by attempting to recompute commitments with known preimages).
+//
+//   The balance is returned to the CALLER ONLY — it is NOT disclosed
+//   to the public ledger. The ZK proof proves the balance was computed
+//   correctly without revealing what it is to third parties.
+//
+// LIMITATION:
+//   In this simplified implementation, we check a fixed number of
+//   potential notes (up to 5). A production implementation would use
+//   a more scalable approach, such as:
+//     - Off-chain note scanning (wallet scans all commitments)
+//     - Encrypted note metadata (wallet decrypts and sums locally)
+//     - Indexed note discovery via viewing keys
+//
+// Parameters (ALL PRIVATE):
+//   ownerAddress — The address to check balance for
+//   ownerSecret  — The owner's secret (proves ownership)
+//   noteSalt0..4 — Salts for up to 5 notes to check
+//   noteAmount0..4 — Expected amounts for each note
+//   noteCount    — Number of notes to check (1-5)
+//
+// Returns: the total balance across all valid notes
+
+export circuit shieldedBalance(
+  ownerAddress: Bytes<32>,
+  ownerSecret: Bytes<32>,
+  noteSalt0: Bytes<32>,
+  noteSalt1: Bytes<32>,
+  noteSalt2: Bytes<32>,
+  noteSalt3: Bytes<32>,
+  noteSalt4: Bytes<32>,
+  noteAmount0: Uint<64>,
+  noteAmount1: Uint<64>,
+  noteAmount2: Uint<64>,
+  noteAmount3: Uint<64>,
+  noteAmount4: Uint<64>,
+  noteCount: Uint<64>
+): Uint<64> {
+  assert(ledger.isInitialized == 1,
+    "Token contract not initialized");
+  assert(noteCount >= 1, "Must check at least 1 note");
+  assert(noteCount <= 5, "Maximum 5 notes per balance check");
+
+  // Accumulate balance across all valid, unspent notes.
+  // We start at zero and add each valid note's amount.
+  // A note is "valid" if:
+  //   1. Its commitment exists in the note set
+  //   2. Its nullifier has NOT been spent
+  //   3. The provided preimage matches the commitment
+
+  // ---- Check Note 0 ----
+  const commitment0: Bytes<32> = persistent_hash(
+    ownerAddress,
+    pad(32, noteAmount0),
+    noteSalt0
+  );
+  const nullifier0: Bytes<32> = persistent_hash(
+    ownerSecret,
+    commitment0
+  );
+  // Verify note exists and is unspent.
+  assert(commitment0 in ledger.noteCommitments,
+    "Note 0 commitment not found");
+  assert(nullifier0 not_in ledger.spentNullifiers,
+    "Note 0 has been spent");
+  const balance0: Uint<64> = noteAmount0;
+
+  // ---- Check Note 1 (if active) ----
+  const balance1: Uint<64> = if (noteCount >= 2) {
+    const commitment1: Bytes<32> = persistent_hash(
+      ownerAddress,
+      pad(32, noteAmount1),
+      noteSalt1
+    );
+    const nullifier1: Bytes<32> = persistent_hash(
+      ownerSecret,
+      commitment1
+    );
+    assert(commitment1 in ledger.noteCommitments,
+      "Note 1 commitment not found");
+    assert(nullifier1 not_in ledger.spentNullifiers,
+      "Note 1 has been spent");
+    noteAmount1
+  } else {
+    0
+  };
+
+  // ---- Check Note 2 (if active) ----
+  const balance2: Uint<64> = if (noteCount >= 3) {
+    const commitment2: Bytes<32> = persistent_hash(
+      ownerAddress,
+      pad(32, noteAmount2),
+      noteSalt2
+    );
+    const nullifier2: Bytes<32> = persistent_hash(
+      ownerSecret,
+      commitment2
+    );
+    assert(commitment2 in ledger.noteCommitments,
+      "Note 2 commitment not found");
+    assert(nullifier2 not_in ledger.spentNullifiers,
+      "Note 2 has been spent");
+    noteAmount2
+  } else {
+    0
+  };
+
+  // ---- Check Note 3 (if active) ----
+  const balance3: Uint<64> = if (noteCount >= 4) {
+    const commitment3: Bytes<32> = persistent_hash(
+      ownerAddress,
+      pad(32, noteAmount3),
+      noteSalt3
+    );
+    const nullifier3: Bytes<32> = persistent_hash(
+      ownerSecret,
+      commitment3
+    );
+    assert(commitment3 in ledger.noteCommitments,
+      "Note 3 commitment not found");
+    assert(nullifier3 not_in ledger.spentNullifiers,
+      "Note 3 has been spent");
+    noteAmount3
+  } else {
+    0
+  };
+
+  // ---- Check Note 4 (if active) ----
+  const balance4: Uint<64> = if (noteCount >= 5) {
+    const commitment4: Bytes<32> = persistent_hash(
+      ownerAddress,
+      pad(32, noteAmount4),
+      noteSalt4
+    );
+    const nullifier4: Bytes<32> = persistent_hash(
+      ownerSecret,
+      commitment4
+    );
+    assert(commitment4 in ledger.noteCommitments,
+      "Note 4 commitment not found");
+    assert(nullifier4 not_in ledger.spentNullifiers,
+      "Note 4 has been spent");
+    noteAmount4
+  } else {
+    0
+  };
+
+  // ---- Compute Total Balance ----
+
+  const totalBalance: Uint<64> = balance0 + balance1 + balance2 + balance3 + balance4;
+
+  // IMPORTANT: We do NOT disclose the balance.
+  // The return value goes to the caller's local DApp only.
+  // The ZK proof proves the computation is correct without
+  // revealing the balance to the network.
+
+  return totalBalance;
+}
+
+
+// ============================================================================
+// CIRCUIT: getTotalSupply
+// ============================================================================
+// Returns the total token supply. This is already public information
+// (stored in the ledger), so this circuit is a simple convenience accessor.
+//
+// No privacy concerns — totalSupply is intentionally public for
+// monetary policy transparency.
+
+export circuit getTotalSupply(): Uint<64> {
+  return ledger.totalSupply;
+}
+
+
+// ============================================================================
+// CIRCUIT: getNoteCount
+// ============================================================================
+// Returns the total number of notes created. Public information
+// for network diagnostics and monitoring.
+
+export circuit getNoteCount(): Uint<64> {
+  return ledger.noteCount;
+}

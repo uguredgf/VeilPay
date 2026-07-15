@@ -1,0 +1,15 @@
+{
+  "name": "veilpay-contracts",
+  "version": "1.0.0",
+  "description": "Uncompiled VeilPay Compact architecture drafts",
+  "author": "VeilPay Team",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/require-toolchain.cjs",
+    "test": "node scripts/require-toolchain.cjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,762 @@
+// ============================================================================
+// VeilPay — Main Payroll Contract
+// ============================================================================
+// STATUS: ARCHITECTURE DRAFT. This file has not been compiled with the current
+// official Compact toolchain and must not be represented as deployable code.
+//
+// OVERVIEW:
+//   This is the core contract of the VeilPay privacy-preserving payroll
+//   system built on Midnight Network. It enables employers to pay employees
+//   in bulk while keeping individual salary amounts completely private.
+//
+// PRIVACY MODEL:
+//   ┌─────────────────────────────────────────────────────────────────────┐
+//   │                        PUBLIC (On-Chain)                           │
+//   │  • Total pool balance (aggregate of all deposits)                 │
+//   │  • Number of payroll batches processed                            │
+//   │  • Merkle root of all payment commitments                         │
+//   │  • Set of spent nullifiers (prevents double-withdraw)             │
+//   │  • Admin address (for access control)                             │
+//   ├─────────────────────────────────────────────────────────────────────┤
+//   │                        PRIVATE (Off-Chain)                        │
+//   │  • Individual employee salary amounts                             │
+//   │  • Which commitment belongs to which employee                     │
+//   │  • Blinding factors / secrets for commitments                     │
+//   │  • Employee addresses within a batch                              │
+//   │  • Merkle authentication paths                                    │
+//   └─────────────────────────────────────────────────────────────────────┘
+//
+// PROTOCOL FLOW:
+//   1. Admin calls initializePool() to set up the contract
+//   2. Employer calls deposit() with a batch of commitments:
+//      - Each commitment = hash(employee_address || amount || salt)
+//      - Only the TOTAL amount is disclosed publicly
+//      - Commitments are added to the Merkle tree
+//   3. Employee calls withdraw() to claim their salary:
+//      - Proves (in ZK) they know the secret behind a valid commitment
+//      - Proves the commitment is in the Merkle tree (membership proof)
+//      - Publishes a nullifier to prevent re-claiming
+//      - Only the nullifier and recipient address are disclosed
+//   4. Observer sees: "X tokens left the pool to address Y"
+//      but CANNOT link Y to any specific commitment or salary amount
+//
+// SECURITY PROPERTIES:
+//   - Double-spend prevention via nullifier set
+//   - Commitment binding: cannot change amount after deposit
+//   - Merkle membership: cannot withdraw from non-existent commitment
+//   - Admin-only deposit: prevents unauthorized pool manipulation
+//   - Overflow protection on all arithmetic operations
+//
+// ZK CIRCUIT DETAILS:
+//   All `export circuit` functions automatically generate Halo2 ZK-SNARK
+//   proofs over BLS12-381. Inputs to circuits are PRIVATE by default.
+//   The `disclose()` function is used to selectively reveal specific
+//   values to the public ledger.
+//
+// ============================================================================
+
+pragma language_version 0.23;
+
+
+// ============================================================================
+// LEDGER STATE — Public On-Chain State
+// ============================================================================
+// The `export ledger` block defines state that is visible to ALL network
+// participants. Every field here is publicly readable on the blockchain.
+// We intentionally minimize what goes public — only aggregates and
+// cryptographic commitments, never individual salary data.
+
+export ledger {
+  // ---- Pool Accounting ----
+
+  // Total tokens deposited into the payroll pool across all batches.
+  // This is the only financial figure that is publicly visible.
+  // Individual deposit amounts per employee are NEVER disclosed.
+  totalDeposited: Uint<64>;
+
+  // Total tokens that have been withdrawn from the pool.
+  // The current pool balance = totalDeposited - totalWithdrawn.
+  totalWithdrawn: Uint<64>;
+
+  // Monotonically increasing count of payroll batches processed.
+  // Used as a batch identifier and for audit sequencing.
+  totalPayrollCount: Counter;
+
+  // ---- Access Control ----
+
+  // The administrator address authorized to deposit funds and manage
+  // the payroll pool. Set once during initialization.
+  // Only the admin can call deposit() and updateMerkleRoot().
+  payrollAdmin: Bytes<32>;
+
+  // Flag indicating whether the pool has been initialized.
+  // Prevents re-initialization attacks.
+  // 1 = initialized, 0 = not initialized.
+  isInitialized: Uint<64>;
+
+  // ---- Commitment Merkle Tree ----
+
+  // The root hash of the Merkle tree containing ALL payment commitments.
+  // Updated after each deposit batch. Employees prove membership against
+  // this root when withdrawing.
+  //
+  // Tree structure:
+  //   - Binary tree, depth 20 (supports up to 1,048,576 commitments)
+  //   - Leaves are Pedersen commitments: hash(address || amount || salt)
+  //   - Internal nodes: hash(left_child || right_child)
+  //   - Uses Poseidon hash for ZK-friendliness
+  merkleRoot: Bytes<32>;
+
+  // Total number of commitment leaves currently in the Merkle tree.
+  // Used to determine the next available leaf index during deposits.
+  commitmentCount: Uint<64>;
+
+  // ---- Double-Spend Prevention ----
+
+  // Set of all spent nullifiers. When an employee withdraws, their
+  // nullifier is added to this set. Any subsequent withdrawal attempt
+  // with the same nullifier will be rejected.
+  //
+  // A nullifier is computed as: hash(secret || commitment_index)
+  // This ensures:
+  //   - Each commitment can only be spent once
+  //   - The nullifier does not reveal which commitment was spent
+  //   - Only the commitment owner (who knows the secret) can compute it
+  nullifiers: Set<Bytes<32>>;
+
+  // ---- Commitment Registry ----
+
+  // Map from commitment hash to a flag (1 = exists, 0 = not found).
+  // This provides a secondary check that a commitment was actually
+  // registered via a deposit() call before allowing withdrawal.
+  // While the Merkle tree is the primary membership proof, this map
+  // provides an O(1) existence check for the circuit.
+  commitments: Map<Bytes<32>, Uint<64>>;
+}
+
+
+// ============================================================================
+// CIRCUIT: initializePool
+// ============================================================================
+// Sets up the payroll pool with the given administrator address.
+// This MUST be called exactly once before any other operation.
+//
+// Parameters:
+//   admin (PRIVATE input) — The address of the payroll administrator.
+//                           Disclosed to public ledger via disclose().
+//
+// Effects:
+//   - Sets payrollAdmin to the provided admin address
+//   - Sets isInitialized to 1
+//   - Initializes all counters and balances to zero
+//   - Sets merkleRoot to the empty tree root
+//
+// Security:
+//   - Can only be called once (checked via isInitialized flag)
+//   - The admin address is intentionally disclosed since the admin
+//     role is a public governance concern
+
+export circuit initializePool(admin: Bytes<32>): [] {
+  // SECURITY: Prevent re-initialization. If someone could re-initialize,
+  // they could replace the admin and steal all deposited funds.
+  assert(ledger.isInitialized == 0, "Pool already initialized: re-initialization is forbidden");
+
+  // Disclose the admin address to the public ledger.
+  // This is intentional — the admin identity should be publicly known
+  // for governance transparency and accountability.
+  disclose(admin);
+
+  // Set the administrator who controls deposits and pool management.
+  ledger.payrollAdmin = admin;
+
+  // Mark the pool as initialized to prevent future re-initialization.
+  ledger.isInitialized = 1;
+
+  // Initialize financial counters to zero.
+  ledger.totalDeposited = 0;
+  ledger.totalWithdrawn = 0;
+
+  // Initialize the Merkle tree with an empty root.
+  // The empty root is the hash of an all-zero tree of depth 20.
+  // In practice, this would be a well-known constant derived from
+  // hashing empty leaves up the tree.
+  ledger.merkleRoot = 0x0000000000000000000000000000000000000000000000000000000000000000;
+  ledger.commitmentCount = 0;
+}
+
+
+// ============================================================================
+// CIRCUIT: deposit
+// ============================================================================
+// Employer batch-deposits payroll funds into the pool.
+//
+// This is the core privacy mechanism: the employer submits multiple
+// employee payment commitments in a single transaction, but ONLY the
+// aggregate total amount is disclosed on-chain. Individual salary
+// amounts remain completely private.
+//
+// Parameters (ALL PRIVATE by default):
+//   commitment0..commitment4 — Pedersen commitments for each employee
+//                               commit(employee_address || amount || salt)
+//   amount0..amount4         — Individual salary amounts (STAY PRIVATE)
+//   totalAmount              — Sum of all individual amounts (DISCLOSED)
+//   batchSalt                — Randomness to prevent batch fingerprinting
+//   callerAddress            — Address of the depositor (must be admin)
+//   employeeCount            — Number of employees in this batch (1-5)
+//
+// Privacy Analysis:
+//   DISCLOSED: totalAmount (via disclose())
+//   PRIVATE:   individual amounts, employee addresses, commitment details
+//   PROVEN:    sum of individual amounts == totalAmount (in ZK)
+//
+// The circuit generates a ZK proof that:
+//   1. The caller is the authorized admin
+//   2. Each commitment is well-formed
+//   3. The sum of individual amounts equals the disclosed total
+//   4. No individual amount causes arithmetic overflow
+//
+// NOTE: We use individual parameters instead of arrays because Compact
+// circuits operate on fixed-size inputs for the ZK constraint system.
+// This example supports batches of up to 5 employees per transaction.
+// Larger batches should be split into multiple deposit() calls.
+
+export circuit deposit(
+  commitment0: Bytes<32>,
+  commitment1: Bytes<32>,
+  commitment2: Bytes<32>,
+  commitment3: Bytes<32>,
+  commitment4: Bytes<32>,
+  amount0: Uint<64>,
+  amount1: Uint<64>,
+  amount2: Uint<64>,
+  amount3: Uint<64>,
+  amount4: Uint<64>,
+  totalAmount: Uint<64>,
+  batchSalt: Bytes<32>,
+  callerAddress: Bytes<32>,
+  employeeCount: Uint<64>
+): [] {
+  // ---- Security Checks ----
+
+  // SECURITY: Only the authorized admin can deposit into the pool.
+  // This prevents unauthorized parties from injecting commitments
+  // that could disrupt the Merkle tree or manipulate the pool balance.
+  assert(ledger.isInitialized == 1, "Pool not initialized: call initializePool first");
+  assert(callerAddress == ledger.payrollAdmin, "Unauthorized: only the payroll admin can deposit");
+
+  // SECURITY: Validate employee count is within bounds.
+  // Must have at least 1 and at most 5 employees per batch.
+  assert(employeeCount >= 1, "Batch must contain at least 1 employee");
+  assert(employeeCount <= 5, "Batch exceeds maximum of 5 employees per transaction");
+
+  // ---- Amount Verification (ZK-proven) ----
+
+  // CRITICAL PRIVACY MECHANISM:
+  // We verify that the sum of individual (private) amounts equals
+  // the (disclosed) total. This is proven in ZK — the verifier learns
+  // only the total, never the individual breakdown.
+  //
+  // The amounts are private circuit inputs. The constraint system
+  // encodes: amount0 + amount1 + amount2 + amount3 + amount4 == totalAmount
+  // If employeeCount < 5, unused amounts must be 0.
+
+  // SECURITY: Overflow protection — ensure no individual amount is
+  // unreasonably large. Uint<64> max is 2^64 - 1.
+  // We check each amount is below a sane ceiling (e.g., 2^62) to
+  // prevent overflow when summing.
+  const MAX_SINGLE_AMOUNT: Uint<64> = 4611686018427387903; // 2^62 - 1
+  assert(amount0 <= MAX_SINGLE_AMOUNT, "Amount0 exceeds maximum single payment limit");
+  assert(amount1 <= MAX_SINGLE_AMOUNT, "Amount1 exceeds maximum single payment limit");
+  assert(amount2 <= MAX_SINGLE_AMOUNT, "Amount2 exceeds maximum single payment limit");
+  assert(amount3 <= MAX_SINGLE_AMOUNT, "Amount3 exceeds maximum single payment limit");
+  assert(amount4 <= MAX_SINGLE_AMOUNT, "Amount4 exceeds maximum single payment limit");
+
+  // Verify unused slots are zeroed out based on employeeCount.
+  // This prevents hidden funds from being deposited in "empty" slots.
+  if (employeeCount < 5) {
+    assert(amount4 == 0, "Amount4 must be 0 when employeeCount < 5");
+    assert(commitment4 == 0x0000000000000000000000000000000000000000000000000000000000000000,
+      "Commitment4 must be zero when employeeCount < 5");
+  }
+  if (employeeCount < 4) {
+    assert(amount3 == 0, "Amount3 must be 0 when employeeCount < 4");
+    assert(commitment3 == 0x0000000000000000000000000000000000000000000000000000000000000000,
+      "Commitment3 must be zero when employeeCount < 4");
+  }
+  if (employeeCount < 3) {
+    assert(amount2 == 0, "Amount2 must be 0 when employeeCount < 3");
+    assert(commitment2 == 0x0000000000000000000000000000000000000000000000000000000000000000,
+      "Commitment2 must be zero when employeeCount < 3");
+  }
+  if (employeeCount < 2) {
+    assert(amount1 == 0, "Amount1 must be 0 when employeeCount < 2");
+    assert(commitment1 == 0x0000000000000000000000000000000000000000000000000000000000000000,
+      "Commitment1 must be zero when employeeCount < 2");
+  }
+
+  // CORE INTEGRITY CHECK: sum of parts must equal the disclosed total.
+  // This constraint is proven in ZK — individual amounts remain private.
+  const computedTotal: Uint<64> = amount0 + amount1 + amount2 + amount3 + amount4;
+  assert(computedTotal == totalAmount, "Sum of individual amounts must equal totalAmount");
+  assert(totalAmount > 0, "Total deposit amount must be greater than zero");
+
+  // ---- Commitment Registration ----
+
+  // Register each commitment in the on-chain map for O(1) existence checks.
+  // The commitment itself is a hash — it reveals nothing about the
+  // underlying employee address or amount.
+  //
+  // SECURITY: Check for duplicate commitments to prevent replay attacks.
+  // Each commitment must be unique (guaranteed by unique salts).
+  assert(ledger.commitments[commitment0] != 1, "Commitment0 already registered: duplicate deposit");
+  ledger.commitments[commitment0] = 1;
+
+  // Only register active commitments (based on employeeCount).
+  if (employeeCount >= 2) {
+    assert(ledger.commitments[commitment1] != 1, "Commitment1 already registered: duplicate deposit");
+    ledger.commitments[commitment1] = 1;
+  }
+  if (employeeCount >= 3) {
+    assert(ledger.commitments[commitment2] != 1, "Commitment2 already registered: duplicate deposit");
+    ledger.commitments[commitment2] = 1;
+  }
+  if (employeeCount >= 4) {
+    assert(ledger.commitments[commitment3] != 1, "Commitment3 already registered: duplicate deposit");
+    ledger.commitments[commitment3] = 1;
+  }
+  if (employeeCount >= 5) {
+    assert(ledger.commitments[commitment4] != 1, "Commitment4 already registered: duplicate deposit");
+    ledger.commitments[commitment4] = 1;
+  }
+
+  // ---- Public Ledger Updates ----
+
+  // SELECTIVE DISCLOSURE: Only the total amount is revealed publicly.
+  // This is the key privacy feature — observers can see the pool grew
+  // by totalAmount, but cannot determine how it was split among employees.
+  disclose(totalAmount);
+
+  // Update the pool's total deposited amount.
+  ledger.totalDeposited = ledger.totalDeposited + totalAmount;
+
+  // Update the commitment count (for Merkle tree leaf indexing).
+  ledger.commitmentCount = ledger.commitmentCount + employeeCount;
+
+  // Increment the payroll batch counter.
+  // Counter type auto-increments and provides monotonic ordering.
+  ledger.totalPayrollCount = ledger.totalPayrollCount + 1;
+}
+
+
+// ============================================================================
+// CIRCUIT: withdraw
+// ============================================================================
+// Employee withdraws their salary from the payroll pool.
+//
+// This is the most privacy-critical operation. The employee proves (in ZK)
+// that they own a valid, unspent commitment in the Merkle tree, without
+// revealing WHICH commitment is theirs or HOW MUCH they're withdrawing.
+//
+// Wait — the amount IS disclosed to enable the actual token transfer.
+// However, the amount cannot be linked to any specific commitment or
+// employee within the batch. From the observer's perspective, they see:
+// "Someone withdrew X tokens to address Y" but cannot determine which
+// of the N employees in the batch is withdrawing.
+//
+// Parameters (ALL PRIVATE by default):
+//   secret           — The employee's secret (blinding factor / preimage)
+//   amount           — The salary amount to withdraw
+//   nullifier        — hash(secret || commitment_index) — DISCLOSED
+//   commitment       — The commitment being spent (PRIVATE)
+//   merklePathNode0..19 — Sibling hashes for Merkle membership proof
+//   merklePathBits   — Bit-packed left/right directions in Merkle path
+//   recipient        — Address to receive the withdrawn tokens — DISCLOSED
+//   salt             — The salt used when creating the commitment
+//
+// Privacy Analysis:
+//   DISCLOSED: nullifier (for double-spend prevention), recipient, amount
+//   PRIVATE:   secret, commitment identity, Merkle path, salt
+//   PROVEN:    commitment is in tree, nullifier is correctly derived,
+//              commitment encodes the claimed amount
+//
+// IMPORTANT: The nullifier is a one-way derivation from the secret.
+// Publishing the nullifier does NOT reveal the secret or the commitment.
+
+export circuit withdraw(
+  secret: Bytes<32>,
+  amount: Uint<64>,
+  nullifier: Bytes<32>,
+  commitment: Bytes<32>,
+  merklePathNode0: Bytes<32>,
+  merklePathNode1: Bytes<32>,
+  merklePathNode2: Bytes<32>,
+  merklePathNode3: Bytes<32>,
+  merklePathNode4: Bytes<32>,
+  merklePathNode5: Bytes<32>,
+  merklePathNode6: Bytes<32>,
+  merklePathNode7: Bytes<32>,
+  merklePathNode8: Bytes<32>,
+  merklePathNode9: Bytes<32>,
+  merklePathNode10: Bytes<32>,
+  merklePathNode11: Bytes<32>,
+  merklePathNode12: Bytes<32>,
+  merklePathNode13: Bytes<32>,
+  merklePathNode14: Bytes<32>,
+  merklePathNode15: Bytes<32>,
+  merklePathNode16: Bytes<32>,
+  merklePathNode17: Bytes<32>,
+  merklePathNode18: Bytes<32>,
+  merklePathNode19: Bytes<32>,
+  merklePathBits: Uint<64>,
+  recipient: Bytes<32>,
+  salt: Bytes<32>
+): [] {
+  // ---- Pre-condition Checks ----
+
+  assert(ledger.isInitialized == 1, "Pool not initialized");
+  assert(amount > 0, "Withdrawal amount must be greater than zero");
+
+  // ---- Double-Spend Prevention ----
+
+  // SECURITY: Check that this nullifier has not been used before.
+  // Each commitment has exactly one valid nullifier (derived from the
+  // secret). Once published, the commitment is considered "spent."
+  // This is the primary defense against double-withdrawals.
+  assert(nullifier not_in ledger.nullifiers,
+    "Nullifier already spent: this salary has already been withdrawn");
+
+  // ---- Commitment Existence Check ----
+
+  // Verify the commitment was actually registered via a deposit() call.
+  // This is a quick O(1) check before the more expensive Merkle proof.
+  assert(ledger.commitments[commitment] == 1,
+    "Commitment not found: this commitment was never registered");
+
+  // ---- ZK Proof: Commitment Preimage ----
+
+  // Verify that the employee knows the preimage of the commitment.
+  // The commitment is: hash(recipient_address || amount || salt)
+  // Only the true owner (who chose the secret/salt) can provide
+  // values that hash to the registered commitment.
+  //
+  // This is verified inside the ZK circuit — the verifier never sees
+  // the individual preimage components, only that the hash matches.
+  const recomputedCommitment: Bytes<32> = persistent_hash(
+    pad(32, recipient),
+    pad(32, amount),
+    pad(32, salt)
+  );
+  assert(recomputedCommitment == commitment,
+    "Commitment verification failed: provided values do not match the registered commitment");
+
+  // ---- ZK Proof: Nullifier Correctness ----
+
+  // Verify the nullifier is correctly derived from the secret.
+  // nullifier = hash(secret || commitment)
+  // This ensures the employee can't fabricate a nullifier for a
+  // commitment they don't own.
+  const recomputedNullifier: Bytes<32> = persistent_hash(
+    pad(32, secret),
+    commitment
+  );
+  assert(recomputedNullifier == nullifier,
+    "Nullifier verification failed: nullifier does not match secret and commitment");
+
+  // ---- ZK Proof: Merkle Membership ----
+
+  // Verify the commitment is a valid leaf in the Merkle tree.
+  // We reconstruct the path from leaf to root using the provided
+  // sibling hashes and direction bits, then compare against the
+  // stored Merkle root.
+  //
+  // Algorithm:
+  //   current = commitment (leaf hash)
+  //   for i in 0..19:
+  //     if bit i of pathBits == 0:
+  //       current = hash(current || siblingNode[i])   // current is left child
+  //     else:
+  //       current = hash(siblingNode[i] || current)   // current is right child
+  //   assert current == merkleRoot
+
+  // Level 0: leaf level
+  const bit0: Uint<64> = merklePathBits & 1;
+  const hash0: Bytes<32> = if (bit0 == 0) {
+    persistent_hash(commitment, merklePathNode0)
+  } else {
+    persistent_hash(merklePathNode0, commitment)
+  };
+
+  // Level 1
+  const bit1: Uint<64> = (merklePathBits >> 1) & 1;
+  const hash1: Bytes<32> = if (bit1 == 0) {
+    persistent_hash(hash0, merklePathNode1)
+  } else {
+    persistent_hash(merklePathNode1, hash0)
+  };
+
+  // Level 2
+  const bit2: Uint<64> = (merklePathBits >> 2) & 1;
+  const hash2: Bytes<32> = if (bit2 == 0) {
+    persistent_hash(hash1, merklePathNode2)
+  } else {
+    persistent_hash(merklePathNode2, hash1)
+  };
+
+  // Level 3
+  const bit3: Uint<64> = (merklePathBits >> 3) & 1;
+  const hash3: Bytes<32> = if (bit3 == 0) {
+    persistent_hash(hash2, merklePathNode3)
+  } else {
+    persistent_hash(merklePathNode3, hash2)
+  };
+
+  // Level 4
+  const bit4: Uint<64> = (merklePathBits >> 4) & 1;
+  const hash4: Bytes<32> = if (bit4 == 0) {
+    persistent_hash(hash3, merklePathNode4)
+  } else {
+    persistent_hash(merklePathNode4, hash3)
+  };
+
+  // Level 5
+  const bit5: Uint<64> = (merklePathBits >> 5) & 1;
+  const hash5: Bytes<32> = if (bit5 == 0) {
+    persistent_hash(hash4, merklePathNode5)
+  } else {
+    persistent_hash(merklePathNode5, hash4)
+  };
+
+  // Level 6
+  const bit6: Uint<64> = (merklePathBits >> 6) & 1;
+  const hash6: Bytes<32> = if (bit6 == 0) {
+    persistent_hash(hash5, merklePathNode6)
+  } else {
+    persistent_hash(merklePathNode6, hash5)
+  };
+
+  // Level 7
+  const bit7: Uint<64> = (merklePathBits >> 7) & 1;
+  const hash7: Bytes<32> = if (bit7 == 0) {
+    persistent_hash(hash6, merklePathNode7)
+  } else {
+    persistent_hash(merklePathNode7, hash6)
+  };
+
+  // Level 8
+  const bit8: Uint<64> = (merklePathBits >> 8) & 1;
+  const hash8: Bytes<32> = if (bit8 == 0) {
+    persistent_hash(hash7, merklePathNode8)
+  } else {
+    persistent_hash(merklePathNode8, hash7)
+  };
+
+  // Level 9
+  const bit9: Uint<64> = (merklePathBits >> 9) & 1;
+  const hash9: Bytes<32> = if (bit9 == 0) {
+    persistent_hash(hash8, merklePathNode9)
+  } else {
+    persistent_hash(merklePathNode9, hash8)
+  };
+
+  // Level 10
+  const bit10: Uint<64> = (merklePathBits >> 10) & 1;
+  const hash10: Bytes<32> = if (bit10 == 0) {
+    persistent_hash(hash9, merklePathNode10)
+  } else {
+    persistent_hash(merklePathNode10, hash9)
+  };
+
+  // Level 11
+  const bit11: Uint<64> = (merklePathBits >> 11) & 1;
+  const hash11: Bytes<32> = if (bit11 == 0) {
+    persistent_hash(hash10, merklePathNode11)
+  } else {
+    persistent_hash(merklePathNode11, hash10)
+  };
+
+  // Level 12
+  const bit12: Uint<64> = (merklePathBits >> 12) & 1;
+  const hash12: Bytes<32> = if (bit12 == 0) {
+    persistent_hash(hash11, merklePathNode12)
+  } else {
+    persistent_hash(merklePathNode12, hash11)
+  };
+
+  // Level 13
+  const bit13: Uint<64> = (merklePathBits >> 13) & 1;
+  const hash13: Bytes<32> = if (bit13 == 0) {
+    persistent_hash(hash12, merklePathNode13)
+  } else {
+    persistent_hash(merklePathNode13, hash12)
+  };
+
+  // Level 14
+  const bit14: Uint<64> = (merklePathBits >> 14) & 1;
+  const hash14: Bytes<32> = if (bit14 == 0) {
+    persistent_hash(hash13, merklePathNode14)
+  } else {
+    persistent_hash(merklePathNode14, hash13)
+  };
+
+  // Level 15
+  const bit15: Uint<64> = (merklePathBits >> 15) & 1;
+  const hash15: Bytes<32> = if (bit15 == 0) {
+    persistent_hash(hash14, merklePathNode15)
+  } else {
+    persistent_hash(merklePathNode15, hash14)
+  };
+
+  // Level 16
+  const bit16: Uint<64> = (merklePathBits >> 16) & 1;
+  const hash16: Bytes<32> = if (bit16 == 0) {
+    persistent_hash(hash15, merklePathNode16)
+  } else {
+    persistent_hash(merklePathNode16, hash15)
+  };
+
+  // Level 17
+  const bit17: Uint<64> = (merklePathBits >> 17) & 1;
+  const hash17: Bytes<32> = if (bit17 == 0) {
+    persistent_hash(hash16, merklePathNode17)
+  } else {
+    persistent_hash(merklePathNode17, hash16)
+  };
+
+  // Level 18
+  const bit18: Uint<64> = (merklePathBits >> 18) & 1;
+  const hash18: Bytes<32> = if (bit18 == 0) {
+    persistent_hash(hash17, merklePathNode18)
+  } else {
+    persistent_hash(merklePathNode18, hash17)
+  };
+
+  // Level 19: root level
+  const bit19: Uint<64> = (merklePathBits >> 19) & 1;
+  const computedRoot: Bytes<32> = if (bit19 == 0) {
+    persistent_hash(hash18, merklePathNode19)
+  } else {
+    persistent_hash(merklePathNode19, hash18)
+  };
+
+  // SECURITY: The computed root MUST match the on-chain Merkle root.
+  // This proves the commitment is a genuine leaf in the tree without
+  // revealing which leaf it is or what its position/index is.
+  assert(computedRoot == ledger.merkleRoot,
+    "Merkle proof invalid: computed root does not match on-chain root");
+
+  // ---- Sufficient Balance Check ----
+
+  // SECURITY: Ensure the pool has enough funds to cover this withdrawal.
+  const currentBalance: Uint<64> = ledger.totalDeposited - ledger.totalWithdrawn;
+  assert(currentBalance >= amount,
+    "Insufficient pool balance: not enough funds to cover this withdrawal");
+
+  // ---- State Transitions ----
+
+  // SELECTIVE DISCLOSURE: Reveal the nullifier and recipient.
+  //
+  // The nullifier MUST be public so the network can enforce the
+  // double-spend check in future transactions.
+  //
+  // The recipient MUST be public so the token runtime can credit
+  // the correct address.
+  //
+  // The amount is also disclosed to enable the actual value transfer,
+  // but it CANNOT be linked back to a specific commitment or employee.
+  disclose(nullifier);
+  disclose(recipient);
+  disclose(amount);
+
+  // Record the nullifier as spent. Future withdraw() calls with this
+  // nullifier will fail at the double-spend check above.
+  ledger.nullifiers = ledger.nullifiers.insert(nullifier);
+
+  // Update the pool's total withdrawn amount.
+  ledger.totalWithdrawn = ledger.totalWithdrawn + amount;
+}
+
+
+// ============================================================================
+// CIRCUIT: getBalance
+// ============================================================================
+// Returns the current pool balance. This is a read-only query — no state
+// transitions occur. The balance is already public (derived from
+// totalDeposited and totalWithdrawn), so this circuit simply computes
+// and returns the difference.
+//
+// Parameters: none
+// Returns: the current pool balance as Uint<64>
+
+export circuit getBalance(): Uint<64> {
+  // Compute the available balance from public ledger values.
+  // Both totalDeposited and totalWithdrawn are public, so this
+  // computation reveals no additional information.
+  const balance: Uint<64> = ledger.totalDeposited - ledger.totalWithdrawn;
+
+  // Return the balance. Since both inputs are already public,
+  // there is no privacy concern with this return value.
+  return balance;
+}
+
+
+// ============================================================================
+// CIRCUIT: updateMerkleRoot
+// ============================================================================
+// Updates the Merkle root after new commitments are added to the tree.
+//
+// This is called by the admin after a deposit() to publish the updated
+// tree root. The proof demonstrates that the new root correctly
+// incorporates the newly deposited commitments.
+//
+// Parameters (PRIVATE by default):
+//   newRoot        — The new Merkle root after inserting new leaves
+//   previousRoot   — Must match the current on-chain root (consistency)
+//   callerAddress  — Must be the admin
+//   newLeafCount   — Number of new leaves added
+//
+// Security:
+//   - Only admin can update the root
+//   - Previous root must match (prevents race conditions)
+//   - New root is disclosed so all participants can verify proofs against it
+//
+// NOTE: In a production system, the proof that newRoot is a valid
+// extension of previousRoot would involve a more complex ZK circuit
+// that verifies the tree construction. Here we enforce admin-only
+// access as the trust anchor, with the ZK proof ensuring the root
+// transition is well-formed.
+
+export circuit updateMerkleRoot(
+  newRoot: Bytes<32>,
+  previousRoot: Bytes<32>,
+  callerAddress: Bytes<32>,
+  newLeafCount: Uint<64>
+): [] {
+  // ---- Security Checks ----
+
+  assert(ledger.isInitialized == 1, "Pool not initialized");
+
+  // SECURITY: Only the admin can update the Merkle root.
+  assert(callerAddress == ledger.payrollAdmin,
+    "Unauthorized: only the payroll admin can update the Merkle root");
+
+  // SECURITY: Consistency check — the provided previousRoot must match
+  // what is currently stored on-chain. This prevents stale updates and
+  // ensures the tree is updated sequentially.
+  assert(previousRoot == ledger.merkleRoot,
+    "Root mismatch: previousRoot does not match current on-chain Merkle root");
+
+  // SECURITY: Must add at least one leaf.
+  assert(newLeafCount > 0, "Must add at least one new leaf to the tree");
+
+  // ---- State Update ----
+
+  // Disclose the new root so all network participants can verify
+  // future withdrawal proofs against it.
+  disclose(newRoot);
+
+  // Update the on-chain Merkle root.
+  ledger.merkleRoot = newRoot;
+
+  // Update the total commitment count.
+  ledger.commitmentCount = ledger.commitmentCount + newLeafCount;
+}

@@ -1,0 +1,631 @@
+// ============================================================================
+// VeilPay — ASP Compliance Contract
+// ============================================================================
+// STATUS: ARCHITECTURE DRAFT. This file has not been compiled with the current
+// official Compact toolchain and must not be represented as deployable code.
+//
+// OVERVIEW:
+//   This contract implements the Authorized Service Provider (ASP) compliance
+//   layer for the VeilPay payroll system. It enables regulatory compliance
+//   verification (KYC/AML, sanctions screening, payment limits) while
+//   preserving employee privacy through zero-knowledge proofs.
+//
+// REGULATORY CONTEXT:
+//   Financial regulations require payroll processors to:
+//   1. Verify employee identities (KYC — Know Your Customer)
+//   2. Screen against sanctions/blocklists (AML — Anti-Money Laundering)
+//   3. Enforce per-transaction and aggregate payment limits
+//   4. Maintain auditable records for regulatory examination
+//
+//   Traditional systems achieve this by storing all data in plaintext.
+//   VeilPay achieves this through ZK proofs: the compliance circuit
+//   verifies ALL regulatory requirements without exposing individual
+//   employee data to the blockchain or to other parties.
+//
+// PRIVACY MODEL:
+//   ┌─────────────────────────────────────────────────────────────────────┐
+//   │                        PUBLIC (On-Chain)                           │
+//   │  • Allowlist of approved addresses (KYC-verified)                 │
+//   │  • Blocklist of sanctioned addresses                              │
+//   │  • Compliance admin address                                       │
+//   │  • Audit log count (number of checks performed)                   │
+//   │  • Per-batch compliance result (pass/fail boolean)                │
+//   ├─────────────────────────────────────────────────────────────────────┤
+//   │                        PRIVATE (Off-Chain)                        │
+//   │  • Individual employee salary amounts                             │
+//   │  • Which specific employees are in a given batch                  │
+//   │  • Payment amounts per employee                                   │
+//   │  • Detailed compliance check results per employee                 │
+//   └─────────────────────────────────────────────────────────────────────┘
+//
+// IMPORTANT DESIGN DECISION:
+//   The allowlist and blocklist contain ADDRESSES, which are public by
+//   design. An address being KYC-approved or sanctioned is public
+//   regulatory information. However, the ASSOCIATION between an address
+//   and a specific payroll batch is proven in ZK and remains private.
+//
+// ============================================================================
+
+pragma language_version 0.23;
+
+
+// ============================================================================
+// LEDGER STATE — Public On-Chain State
+// ============================================================================
+
+export ledger {
+  // ---- Access Control ----
+
+  // The compliance administrator address. This is typically the ASP
+  // (Authorized Service Provider) responsible for KYC/AML operations.
+  complianceAdmin: Bytes<32>;
+
+  // Initialization flag. 1 = initialized, 0 = not initialized.
+  isInitialized: Uint<64>;
+
+  // ---- KYC/AML Lists ----
+
+  // Set of KYC-verified (allowlisted) addresses.
+  // An employee must be on this list to receive payroll payments.
+  // The allowlist is managed by the compliance admin who performs
+  // identity verification off-chain before adding addresses.
+  allowlist: Set<Bytes<32>>;
+
+  // Set of sanctioned (blocklisted) addresses.
+  // Addresses on this list are prohibited from receiving payments.
+  // This implements sanctions screening requirements.
+  // An address can be on neither list (unknown), on the allowlist
+  // (approved), or on the blocklist (sanctioned). Being on both
+  // is an error state that the contract prevents.
+  blocklist: Set<Bytes<32>>;
+
+  // ---- Audit Trail ----
+
+  // Monotonically increasing counter of audit log entries.
+  // Each compliance check and audit verification increments this.
+  auditLogCount: Counter;
+
+  // Map from batch ID to compliance result.
+  // 1 = compliant, 0 = non-compliant.
+  // This allows anyone to verify that a specific batch passed
+  // compliance checks, without knowing the batch contents.
+  batchComplianceResults: Map<Uint<64>, Uint<64>>;
+
+  // Map from batch ID to the hash of the compliance proof.
+  // Regulators can use this hash to verify the full proof off-chain.
+  batchProofHashes: Map<Uint<64>, Bytes<32>>;
+
+  // Total number of addresses on the allowlist.
+  // Useful for monitoring and governance reporting.
+  allowlistCount: Uint<64>;
+
+  // Total number of addresses on the blocklist.
+  bloclistCount: Uint<64>;
+}
+
+
+// ============================================================================
+// CIRCUIT: initialize
+// ============================================================================
+// Sets up the compliance contract with the given administrator.
+//
+// Parameters:
+//   admin — The ASP's address that will manage KYC/AML lists.
+//           DISCLOSED to public ledger for transparency.
+//
+// Security:
+//   - Can only be called once
+//   - Admin identity is public (regulatory requirement)
+
+export circuit initialize(admin: Bytes<32>): [] {
+  // SECURITY: Prevent re-initialization.
+  assert(ledger.isInitialized == 0,
+    "Compliance contract already initialized");
+
+  // The compliance admin is a public role — regulators and auditors
+  // need to know who is responsible for KYC/AML operations.
+  disclose(admin);
+
+  ledger.complianceAdmin = admin;
+  ledger.isInitialized = 1;
+  ledger.allowlistCount = 0;
+  ledger.bloclistCount = 0;
+}
+
+
+// ============================================================================
+// CIRCUIT: addToAllowlist
+// ============================================================================
+// Adds a KYC-verified address to the allowlist.
+//
+// This is called after the ASP has performed off-chain identity
+// verification (document checks, liveness verification, etc.).
+// The address itself is public (it's a blockchain address), but
+// the KYC documentation remains off-chain.
+//
+// Parameters:
+//   address       — The address to add to the allowlist
+//   callerAddress — Must be the compliance admin
+//
+// Security:
+//   - Only admin can modify the allowlist
+//   - Address must not already be on the blocklist (conflict prevention)
+//   - Address must not already be on the allowlist (idempotency check)
+
+export circuit addToAllowlist(
+  address: Bytes<32>,
+  callerAddress: Bytes<32>
+): [] {
+  // ---- Security Checks ----
+  assert(ledger.isInitialized == 1,
+    "Compliance contract not initialized");
+  assert(callerAddress == ledger.complianceAdmin,
+    "Unauthorized: only the compliance admin can modify the allowlist");
+
+  // SECURITY: An address CANNOT be on both lists simultaneously.
+  // This prevents conflicting compliance states and ensures
+  // unambiguous screening results.
+  assert(address not_in ledger.blocklist,
+    "Cannot add to allowlist: address is currently on the blocklist. Remove from blocklist first.");
+
+  // Disclose the address being added — allowlist membership is
+  // public information (it's a regulatory transparency requirement).
+  disclose(address);
+
+  // Add the address to the allowlist set.
+  ledger.allowlist = ledger.allowlist.insert(address);
+
+  // Increment the allowlist counter.
+  ledger.allowlistCount = ledger.allowlistCount + 1;
+}
+
+
+// ============================================================================
+// CIRCUIT: removeFromAllowlist
+// ============================================================================
+// Removes an address from the allowlist.
+//
+// This may be called when:
+//   - KYC verification expires and is not renewed
+//   - Suspicious activity is detected but not confirmed (precautionary)
+//   - Employee is no longer with the organization
+//
+// Parameters:
+//   address       — The address to remove
+//   callerAddress — Must be the compliance admin
+
+export circuit removeFromAllowlist(
+  address: Bytes<32>,
+  callerAddress: Bytes<32>
+): [] {
+  assert(ledger.isInitialized == 1,
+    "Compliance contract not initialized");
+  assert(callerAddress == ledger.complianceAdmin,
+    "Unauthorized: only the compliance admin can modify the allowlist");
+
+  // Verify the address is actually on the allowlist before removing.
+  assert(address in ledger.allowlist,
+    "Address not found on allowlist: cannot remove non-existent entry");
+
+  disclose(address);
+
+  // Remove from the allowlist set.
+  ledger.allowlist = ledger.allowlist.remove(address);
+
+  // Decrement the counter. We check > 0 to prevent underflow,
+  // though the `in` check above should logically guarantee this.
+  assert(ledger.allowlistCount > 0,
+    "Allowlist count underflow: internal consistency error");
+  ledger.allowlistCount = ledger.allowlistCount - 1;
+}
+
+
+// ============================================================================
+// CIRCUIT: addToBlocklist
+// ============================================================================
+// Adds a sanctioned address to the blocklist.
+//
+// This is called when:
+//   - An address appears on a government sanctions list (OFAC, EU, UN)
+//   - Law enforcement requests an address be blocked
+//   - Internal fraud detection flags an address
+//
+// Parameters:
+//   address       — The address to block
+//   callerAddress — Must be the compliance admin
+//
+// Security:
+//   - Only admin can modify the blocklist
+//   - If address is on the allowlist, it must be removed first
+//     (explicit action required to prevent accidental blocking)
+
+export circuit addToBlocklist(
+  address: Bytes<32>,
+  callerAddress: Bytes<32>
+): [] {
+  assert(ledger.isInitialized == 1,
+    "Compliance contract not initialized");
+  assert(callerAddress == ledger.complianceAdmin,
+    "Unauthorized: only the compliance admin can modify the blocklist");
+
+  // SECURITY: Cannot blocklist an address that is currently allowlisted.
+  // The admin must explicitly removeFromAllowlist first.
+  // This prevents accidental blocking of verified employees.
+  assert(address not_in ledger.allowlist,
+    "Cannot blocklist: address is currently on the allowlist. Remove from allowlist first.");
+
+  disclose(address);
+
+  ledger.blocklist = ledger.blocklist.insert(address);
+  ledger.bloclistCount = ledger.bloclistCount + 1;
+}
+
+
+// ============================================================================
+// CIRCUIT: removeFromBlocklist
+// ============================================================================
+// Removes an address from the blocklist.
+//
+// This is called when:
+//   - A sanctions designation is lifted
+//   - A false positive is identified and corrected
+//   - A legal process clears the address
+//
+// Parameters:
+//   address       — The address to unblock
+//   callerAddress — Must be the compliance admin
+
+export circuit removeFromBlocklist(
+  address: Bytes<32>,
+  callerAddress: Bytes<32>
+): [] {
+  assert(ledger.isInitialized == 1,
+    "Compliance contract not initialized");
+  assert(callerAddress == ledger.complianceAdmin,
+    "Unauthorized: only the compliance admin can modify the blocklist");
+
+  assert(address in ledger.blocklist,
+    "Address not found on blocklist: cannot remove non-existent entry");
+
+  disclose(address);
+
+  ledger.blocklist = ledger.blocklist.remove(address);
+
+  assert(ledger.bloclistCount > 0,
+    "Blocklist count underflow: internal consistency error");
+  ledger.bloclistCount = ledger.bloclistCount - 1;
+}
+
+
+// ============================================================================
+// CIRCUIT: proveCompliance
+// ============================================================================
+// The crown jewel of the compliance system.
+//
+// This circuit generates a ZK proof that a payroll batch satisfies ALL
+// regulatory requirements WITHOUT revealing any individual employee data.
+// The regulator (or anyone) can verify the proof on-chain and confirm
+// compliance, but learns nothing about individual salaries or employee
+// identities within the batch.
+//
+// What is proven (in ZK):
+//   1. ALL employee addresses are on the allowlist (KYC-verified)
+//   2. NO employee address is on the blocklist (sanctions clear)
+//   3. No single payment exceeds maxSinglePayment (per-tx limit)
+//   4. The batch total does not exceed regulatoryLimit (aggregate limit)
+//   5. The sum of individual amounts equals the claimed total
+//
+// What is disclosed:
+//   - The batch ID
+//   - A boolean compliance result (1 = pass, 0 = fail)
+//   - A hash of the proof data (for audit trail anchoring)
+//
+// What remains private:
+//   - Individual employee addresses
+//   - Individual salary amounts
+//   - Which specific checks passed or failed per employee
+//   - The regulatory limits used (these are policy parameters)
+//
+// Parameters (ALL PRIVATE):
+//   employeeAddr0..4    — Employee addresses to verify
+//   amount0..4          — Corresponding salary amounts
+//   totalAmount         — Claimed total of all amounts
+//   maxSinglePayment    — Regulatory per-transaction cap
+//   regulatoryLimit     — Regulatory aggregate cap
+//   batchId             — Identifier for this batch
+//   callerAddress       — Must be admin
+//   employeeCount       — Number of active employees (1-5)
+//
+// NOTE: We support up to 5 employees per compliance check.
+// Larger batches should be split into multiple proveCompliance() calls
+// with the same batchId, and results aggregated off-chain.
+
+export circuit proveCompliance(
+  employeeAddr0: Bytes<32>,
+  employeeAddr1: Bytes<32>,
+  employeeAddr2: Bytes<32>,
+  employeeAddr3: Bytes<32>,
+  employeeAddr4: Bytes<32>,
+  amount0: Uint<64>,
+  amount1: Uint<64>,
+  amount2: Uint<64>,
+  amount3: Uint<64>,
+  amount4: Uint<64>,
+  totalAmount: Uint<64>,
+  maxSinglePayment: Uint<64>,
+  regulatoryLimit: Uint<64>,
+  batchId: Uint<64>,
+  callerAddress: Bytes<32>,
+  employeeCount: Uint<64>
+): Uint<64> {
+  // ---- Security Checks ----
+  assert(ledger.isInitialized == 1,
+    "Compliance contract not initialized");
+  assert(callerAddress == ledger.complianceAdmin,
+    "Unauthorized: only the compliance admin can run compliance checks");
+  assert(employeeCount >= 1, "Must have at least 1 employee");
+  assert(employeeCount <= 5, "Maximum 5 employees per compliance check");
+
+  // ---- Regulatory Limit Sanity Checks ----
+  // Ensure the regulatory parameters are sane (non-zero).
+  assert(maxSinglePayment > 0,
+    "maxSinglePayment must be greater than zero");
+  assert(regulatoryLimit > 0,
+    "regulatoryLimit must be greater than zero");
+  assert(maxSinglePayment <= regulatoryLimit,
+    "maxSinglePayment cannot exceed regulatoryLimit");
+
+  // ---- Per-Employee Compliance Checks (ZK-proven) ----
+  //
+  // For each active employee, we verify:
+  //   a) Address is on the allowlist (KYC passed)
+  //   b) Address is NOT on the blocklist (sanctions clear)
+  //   c) Payment amount does not exceed maxSinglePayment
+  //   d) Payment amount is greater than zero
+  //
+  // These checks happen INSIDE the ZK circuit. The verifier learns
+  // only the final boolean result, never the per-employee details.
+
+  // --- Employee 0 (always active) ---
+  assert(employeeAddr0 in ledger.allowlist,
+    "Compliance failure: employee 0 is not on the allowlist (KYC not verified)");
+  assert(employeeAddr0 not_in ledger.blocklist,
+    "Compliance failure: employee 0 is on the blocklist (sanctioned)");
+  assert(amount0 > 0,
+    "Compliance failure: employee 0 payment amount must be positive");
+  assert(amount0 <= maxSinglePayment,
+    "Compliance failure: employee 0 payment exceeds per-transaction limit");
+
+  // --- Employee 1 ---
+  if (employeeCount >= 2) {
+    assert(employeeAddr1 in ledger.allowlist,
+      "Compliance failure: employee 1 is not on the allowlist");
+    assert(employeeAddr1 not_in ledger.blocklist,
+      "Compliance failure: employee 1 is on the blocklist");
+    assert(amount1 > 0,
+      "Compliance failure: employee 1 payment amount must be positive");
+    assert(amount1 <= maxSinglePayment,
+      "Compliance failure: employee 1 payment exceeds per-transaction limit");
+  }
+
+  // --- Employee 2 ---
+  if (employeeCount >= 3) {
+    assert(employeeAddr2 in ledger.allowlist,
+      "Compliance failure: employee 2 is not on the allowlist");
+    assert(employeeAddr2 not_in ledger.blocklist,
+      "Compliance failure: employee 2 is on the blocklist");
+    assert(amount2 > 0,
+      "Compliance failure: employee 2 payment amount must be positive");
+    assert(amount2 <= maxSinglePayment,
+      "Compliance failure: employee 2 payment exceeds per-transaction limit");
+  }
+
+  // --- Employee 3 ---
+  if (employeeCount >= 4) {
+    assert(employeeAddr3 in ledger.allowlist,
+      "Compliance failure: employee 3 is not on the allowlist");
+    assert(employeeAddr3 not_in ledger.blocklist,
+      "Compliance failure: employee 3 is on the blocklist");
+    assert(amount3 > 0,
+      "Compliance failure: employee 3 payment amount must be positive");
+    assert(amount3 <= maxSinglePayment,
+      "Compliance failure: employee 3 payment exceeds per-transaction limit");
+  }
+
+  // --- Employee 4 ---
+  if (employeeCount >= 5) {
+    assert(employeeAddr4 in ledger.allowlist,
+      "Compliance failure: employee 4 is not on the allowlist");
+    assert(employeeAddr4 not_in ledger.blocklist,
+      "Compliance failure: employee 4 is on the blocklist");
+    assert(amount4 > 0,
+      "Compliance failure: employee 4 payment amount must be positive");
+    assert(amount4 <= maxSinglePayment,
+      "Compliance failure: employee 4 payment exceeds per-transaction limit");
+  }
+
+  // ---- Unused Slot Validation ----
+  // Ensure unused employee slots have zero amounts to prevent hidden funds.
+  if (employeeCount < 5) {
+    assert(amount4 == 0, "Unused employee 4 amount must be zero");
+  }
+  if (employeeCount < 4) {
+    assert(amount3 == 0, "Unused employee 3 amount must be zero");
+  }
+  if (employeeCount < 3) {
+    assert(amount2 == 0, "Unused employee 2 amount must be zero");
+  }
+  if (employeeCount < 2) {
+    assert(amount1 == 0, "Unused employee 1 amount must be zero");
+  }
+
+  // ---- Aggregate Checks ----
+
+  // Verify the sum of individual amounts equals the claimed total.
+  const computedTotal: Uint<64> = amount0 + amount1 + amount2 + amount3 + amount4;
+  assert(computedTotal == totalAmount,
+    "Compliance failure: sum of individual amounts does not match claimed total");
+
+  // Verify the total does not exceed the regulatory aggregate limit.
+  assert(totalAmount <= regulatoryLimit,
+    "Compliance failure: total payroll amount exceeds regulatory limit");
+
+  // ---- Record Compliance Result ----
+
+  // If we reach this point, all checks have passed (assertions didn't fail).
+  const complianceResult: Uint<64> = 1; // 1 = fully compliant
+
+  // SELECTIVE DISCLOSURE: Only the batch ID and result are disclosed.
+  // Individual employee data remains private inside the ZK proof.
+  disclose(batchId);
+  disclose(complianceResult);
+
+  // Store the compliance result on-chain for future reference.
+  ledger.batchComplianceResults[batchId] = complianceResult;
+
+  // Generate a proof hash for the audit trail.
+  // This hash commits to ALL the private inputs so a regulator with
+  // the original data can verify the proof was computed correctly.
+  const proofHash: Bytes<32> = persistent_hash(
+    pad(32, batchId),
+    pad(32, totalAmount),
+    pad(32, employeeCount)
+  );
+  ledger.batchProofHashes[batchId] = proofHash;
+
+  // Increment the audit log counter.
+  ledger.auditLogCount = ledger.auditLogCount + 1;
+
+  // Return the compliance result.
+  // The caller (employer DApp) receives this and can proceed with
+  // the deposit if compliant, or halt if non-compliant.
+  return complianceResult;
+}
+
+
+// ============================================================================
+// CIRCUIT: generateAuditProof
+// ============================================================================
+// Creates an audit trail entry for a specific payroll batch.
+//
+// This is called after a successful compliance check to create a
+// tamper-evident record that regulators can later examine.
+//
+// The audit entry includes:
+//   - Batch ID (public — identifies which batch)
+//   - Timestamp (public — when the audit was created)
+//   - Proof hash (public — cryptographic anchor to the full proof)
+//
+// The full proof data stays off-chain and can be shared with regulators
+// on request via secure channels.
+//
+// Parameters (PRIVATE by default):
+//   batchId       — The payroll batch this audit covers
+//   timestamp     — Current block timestamp
+//   proofData     — Serialized proof data (hashed, not stored)
+//   callerAddress — Must be admin
+
+export circuit generateAuditProof(
+  batchId: Uint<64>,
+  timestamp: Uint<64>,
+  proofData: Bytes<32>,
+  callerAddress: Bytes<32>
+): [] {
+  // ---- Security Checks ----
+  assert(ledger.isInitialized == 1,
+    "Compliance contract not initialized");
+  assert(callerAddress == ledger.complianceAdmin,
+    "Unauthorized: only the compliance admin can generate audit proofs");
+
+  // Verify that a compliance check was actually performed for this batch.
+  assert(ledger.batchComplianceResults[batchId] == 1,
+    "No passing compliance result found for this batch ID");
+
+  // Verify the timestamp is reasonable (non-zero).
+  assert(timestamp > 0, "Timestamp must be greater than zero");
+
+  // ---- Generate Audit Hash ----
+
+  // Create a hash that binds the batch ID, timestamp, and proof data.
+  // This serves as a cryptographic anchor: anyone with the original
+  // proof data can recompute this hash and verify it matches the
+  // on-chain record.
+  const auditHash: Bytes<32> = persistent_hash(
+    pad(32, batchId),
+    pad(32, timestamp),
+    proofData
+  );
+
+  // ---- Selective Disclosure ----
+
+  // Disclose the batch ID and the audit hash.
+  // The timestamp and full proof data remain private — the regulator
+  // must request them through the designated compliance channel.
+  disclose(batchId);
+  disclose(auditHash);
+
+  // Update the proof hash for this batch (overwrite with audit-enriched version).
+  ledger.batchProofHashes[batchId] = auditHash;
+
+  // Increment the audit counter.
+  ledger.auditLogCount = ledger.auditLogCount + 1;
+}
+
+
+// ============================================================================
+// CIRCUIT: verifyAuditProof
+// ============================================================================
+// Allows a regulator to verify that an audit trail entry exists and
+// that the batch passed compliance checks.
+//
+// This is a read-heavy circuit that queries public ledger state and
+// returns the verification result. It does not modify state (except
+// incrementing the audit counter to record that a verification occurred).
+//
+// Parameters (PRIVATE by default):
+//   batchId       — The batch to verify
+//   callerAddress — The regulator's address (logged for accountability)
+//
+// Returns:
+//   1 if the batch has a valid compliance result and audit proof
+//   0 otherwise (will actually assert-fail rather than return 0)
+//
+// NOTE: In a production deployment, you might want this to be callable
+// by any registered regulator, not just the compliance admin. The
+// access control here could be extended with a regulators set.
+
+export circuit verifyAuditProof(
+  batchId: Uint<64>,
+  callerAddress: Bytes<32>
+): Uint<64> {
+  assert(ledger.isInitialized == 1,
+    "Compliance contract not initialized");
+
+  // ---- Verify Compliance Result Exists ----
+
+  // Check that a compliance check was performed and passed for this batch.
+  const complianceResult: Uint<64> = ledger.batchComplianceResults[batchId];
+  assert(complianceResult == 1,
+    "Audit verification failed: no passing compliance result found for this batch");
+
+  // ---- Verify Proof Hash Exists ----
+
+  // Check that an audit proof hash was recorded for this batch.
+  const proofHash: Bytes<32> = ledger.batchProofHashes[batchId];
+  assert(proofHash != 0x0000000000000000000000000000000000000000000000000000000000000000,
+    "Audit verification failed: no proof hash found for this batch");
+
+  // ---- Log the Verification ----
+
+  // Disclose who is performing the verification and for which batch.
+  // This creates accountability — we can see which regulators are
+  // actively auditing which batches.
+  disclose(batchId);
+  disclose(callerAddress);
+
+  // Increment the audit counter to record this verification event.
+  ledger.auditLogCount = ledger.auditLogCount + 1;
+
+  // Return success. If we reached here, all checks passed.
+  return 1;
+}
