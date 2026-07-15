@@ -25,7 +25,10 @@ function getAvailableWallets(): InitialAPI[] {
   if (!window.midnight) {
     return [];
   }
-  return Object.values(window.midnight);
+  return Object.values(window.midnight).filter(
+    (wallet): wallet is InitialAPI =>
+      Boolean(wallet) && typeof wallet.name === 'string' && typeof wallet.connect === 'function',
+  );
 }
 
 function isRetryableNetworkError(error: unknown): boolean {
@@ -47,16 +50,40 @@ const WalletConnect: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [detectionComplete, setDetectionComplete] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const check = () => setWallets(getAvailableWallets());
+    const check = () => {
+      const discoveredWallets = getAvailableWallets();
+      setWallets(discoveredWallets);
+      if (discoveredWallets.length > 0) {
+        setDetectionComplete(true);
+      }
+    };
+
     check();
-    const firstTimer = window.setTimeout(check, 500);
-    const secondTimer = window.setTimeout(check, 1500);
+    const interval = window.setInterval(check, 500);
+    const stopTimer = window.setTimeout(() => {
+      window.clearInterval(interval);
+      setDetectionComplete(true);
+    }, 10_000);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        check();
+      }
+    };
+
+    window.addEventListener('focus', check);
+    window.addEventListener('pageshow', check);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
-      window.clearTimeout(firstTimer);
-      window.clearTimeout(secondTimer);
+      window.clearInterval(interval);
+      window.clearTimeout(stopTimer);
+      window.removeEventListener('focus', check);
+      window.removeEventListener('pageshow', check);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, []);
 
@@ -138,17 +165,51 @@ const WalletConnect: React.FC = () => {
 
   if (wallets.length === 0 && !address) {
     return (
-      <a
-        href={LACE_EXTENSION_URL}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="wallet-btn"
-        title="Install Lace Wallet extension to connect"
-      >
-        <Wallet size={15} />
-        <span>Install Lace</span>
-        <ExternalLink size={12} style={{ opacity: 0.5 }} />
-      </a>
+      <div ref={ref} style={{ position: 'relative' }}>
+        <button
+          className="wallet-btn"
+          onClick={() => {
+            const discoveredWallets = getAvailableWallets();
+            setWallets(discoveredWallets);
+            setDetectionComplete(true);
+            setDropdownOpen(discoveredWallets.length === 0);
+          }}
+        >
+          <Wallet size={15} />
+          <span>{detectionComplete ? 'Connect Lace' : 'Detecting Lace...'}</span>
+        </button>
+
+        {dropdownOpen && (
+          <div
+            style={{
+              position: 'absolute',
+              top: 'calc(100% + 6px)',
+              right: 0,
+              background: 'var(--bg-surface-2)',
+              border: '1px solid var(--border)',
+              borderRadius: '8px',
+              padding: '0.75rem',
+              width: '280px',
+              zIndex: 100,
+            }}
+          >
+            <div style={{ fontSize: '0.78rem', lineHeight: 1.45, color: 'var(--text-muted)' }}>
+              Lace was not detected. Enable the Lace extension for this site, then refresh the page
+              or click Connect Lace again. Use Chrome or Brave with the same browser profile where
+              Lace is installed.
+            </div>
+            <a
+              href={LACE_EXTENSION_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn btn-ghost btn-sm"
+              style={{ width: '100%', marginTop: '0.5rem', justifyContent: 'flex-start', gap: '0.5rem' }}
+            >
+              <ExternalLink size={13} /> Open Lace in Chrome Web Store
+            </a>
+          </div>
+        )}
+      </div>
     );
   }
 
