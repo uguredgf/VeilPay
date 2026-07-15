@@ -46,12 +46,14 @@ const LACE_EXTENSION_ORIGIN = 'chrome-extension://gafhhkghbfjjkeiendhlofajokpafl
 
 const app = express();
 
-// Lace injects its DApp connector into the page's main execution world.
+// Lace runs its DApp connector in the page's main world and loads packaged
+// chunks and WebAssembly from its own extension origin.
 app.use(
   helmet({
     contentSecurityPolicy: {
       directives: {
-        scriptSrc: ["'self'", LACE_EXTENSION_ORIGIN],
+        scriptSrc: ["'self'", "'wasm-unsafe-eval'", LACE_EXTENSION_ORIGIN],
+        connectSrc: ["'self'", LACE_EXTENSION_ORIGIN],
       },
     },
   }),
